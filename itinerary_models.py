@@ -40,6 +40,11 @@ class Event(BaseModel):
     location: str
     city: str
     description: str
+    poi_id: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    planned_duration_minutes: Optional[int] = None
+    itinerary_role: Optional[str] = None
 
 
 class Day(BaseModel):
@@ -71,6 +76,19 @@ def _format_haversine(distance_km: float) -> str:
         time_str = f"{h} hr {m} mins" if m else f"{h} hr"
     dist_str = f"{int(distance_km * 1000)} m" if distance_km < 1 else f"{distance_km:.1f} km"
     return f"By foot (est.): {time_str} ({dist_str})"
+
+
+def _estimate_travel_from_coords(
+    origin_coords: Tuple[float, float],
+    destination_coords: Tuple[float, float],
+) -> Tuple[str, str]:
+    dist = _haversine_km(
+        origin_coords[0],
+        origin_coords[1],
+        destination_coords[0],
+        destination_coords[1],
+    )
+    return _format_haversine(dist), "haversine-local"
 
 
 # ---------------------------------------------------------------------------
@@ -192,15 +210,18 @@ def update_itinerary_with_travel_times(
         return ReplyResult(
             message=(
                 "Structured itinerary not found. "
-                "Please create the structured output via structured_output_agent."
+                "Ask planner_agent to submit a valid itinerary via submit_itinerary_for_critique first."
             ),
             context_variables=context_variables,
-            target=AgentNameTarget("structured_output_agent"),
+            target=AgentNameTarget("planner_agent"),
         )
 
     if "timed_itinerary" in context_variables:
         return ReplyResult(
-            message="Timed itinerary already done, inform the customer that their itinerary is ready!",
+            message=(
+                "Timed itinerary already in context; route_timing_agent should hand back to planner_agent "
+                "for natural-language delivery."
+            ),
             context_variables=context_variables,
             target=StayTarget(),
         )
@@ -208,6 +229,17 @@ def update_itinerary_with_travel_times(
     itinerary_object = Itinerary.model_validate(
         json.loads(context_variables["structured_itinerary"])
     )
+    poi_candidates = context_variables.get("poi_candidates") or []
+    coord_lookup: Dict[str, Tuple[float, float]] = {}
+    for candidate in poi_candidates:
+        try:
+            name = str(candidate.get("name") or "").strip()
+            lat = float(candidate.get("latitude"))
+            lon = float(candidate.get("longitude"))
+        except (TypeError, ValueError):
+            continue
+        if name:
+            coord_lookup[name] = (lat, lon)
 
     for day in itinerary_object.days:
         events = day.events
@@ -217,8 +249,12 @@ def update_itinerary_with_travel_times(
                 pre_event = events[i - 1]
                 origin = f"{pre_event.location}, {pre_event.city}"
                 destination = f"{cur_event.location}, {cur_event.city}"
-
-                travel_desc, mode = _estimate_travel(origin, destination)
+                origin_coords = coord_lookup.get(pre_event.location)
+                destination_coords = coord_lookup.get(cur_event.location)
+                if origin_coords and destination_coords:
+                    travel_desc, mode = _estimate_travel_from_coords(origin_coords, destination_coords)
+                else:
+                    travel_desc, mode = _estimate_travel(origin, destination)
 
                 if mode == "driving":
                     travel_location = (

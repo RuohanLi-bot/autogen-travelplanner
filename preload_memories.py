@@ -22,7 +22,9 @@ from typing import Dict, List, Tuple, Union
 
 from dotenv import load_dotenv
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent
+ENV_FILE = PROJECT_ROOT / ".env"
+load_dotenv(ENV_FILE)
 
 logger = logging.getLogger(__name__)
 
@@ -124,11 +126,6 @@ def preload_reviews(
                 reviews.append(json.loads(line))
     n = len(reviews)
     logger.info("  Total reviews: %d", n)
-
-    if n == 0:
-        logger.info("Done. No reviews to load.")
-        return 0
-
     TARGET_BATCHES = 10
     num_batches = min(TARGET_BATCHES, n)
     ranges = _even_chunk_ranges(n, num_batches)
@@ -170,6 +167,8 @@ def main():
             "provider": "openai",
             "config": {
                 "model": "gpt-4o-mini",
+                "api_key": os.environ.get("OPENAI_API_KEY"),
+                "openai_base_url": os.environ.get("OPENAI_BASE_URL"),
                 "temperature": 0.2,
                 "max_tokens": 5000,
                 "top_p": 1.0,
@@ -193,7 +192,7 @@ def main():
         "graph_store": {
             "provider": "neo4j",
             "config": {
-                "url": os.environ.get("NEO4J_URL", "bolt://10.176.25.117:8687"),
+                "url": os.environ.get("NEO4J_URL"),
                 "username": os.environ.get("NEO4J_USERNAME"),
                 "password": os.environ.get("NEO4J_PASSWORD"),
                 "database": os.environ.get("NEO4J_DATABASE"),
