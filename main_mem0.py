@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import select
 import shlex
 import shutil
 import subprocess
@@ -85,19 +86,27 @@ from xhs_travel_graph.graph_repository import Mem0Neo4jQueryRunner
 from xhs_travel_graph.matcher import query_matching_play_modes
 from xhs_travel_graph.models import MatchResult
 from xhs_travel_graph.pipeline import ingest_autoglm_json_to_structured_xhs_graph
+from xhs_travel_graph.post_parser import load_autoglm_posts
 from xhs_travel_graph.profile_parser import parse_traveler_profile
-from xhs_constraints.candidate_builder import build_candidates_from_matches
-from xhs_constraints.capability_estimator import estimate_profile_capability
-from xhs_constraints.capability_extractor import extract_capability_observations_from_json
-from xhs_constraints.capability_graph_repository import load_capability_estimate
 from xhs_constraints.capability_graph_writer import CapabilityGraphWriter
-from xhs_constraints.capability_merge import merge_capability_estimates
+from xhs_constraints.capability_grounding import (
+    load_answers_from_existing_grounding_payloads,
+    parse_capability_observations,
+    run_capability_grounding,
+    summarize_capability_grounding,
+)
+from xhs_constraints.constraint_calibrator import (
+    build_planning_budget,
+    calibrate_capability_estimate,
+    planning_budget_to_constraints,
+    summarize_capability_estimate,
+    summarize_planning_budget,
+)
 from xhs_constraints.final_writer import write_final_itinerary
-from xhs_constraints.interpreter import interpret_constraint_intent
-from xhs_constraints.optimizer import optimize_itinerary
-from xhs_constraints.resolver import resolve_constraints
-from xhs_constraints.rule_catalog import RuleCatalog
-from xhs_constraints.scorer import score_candidates
+from xhs_constraints.optimizer import optimize_itinerary_from_play_modes
+from xhs_constraints.playmode_fits import build_play_mode_fits, summarize_play_mode_fits
+from xhs_constraints.query_semantics import build_profile_signature, generate_capability_questions, infer_demand_graph
+from xhs_constraints.scorer import score_play_modes, summarize_scored_play_modes
 from xhs_constraints.validator import validate_final_itinerary
 
 logger = logging.getLogger(__name__)
@@ -237,9 +246,72 @@ AUTOGLM_RESULT_PATH = Path(
 AUTOGLM_ROOT = Path("/data/lrh/Open-AutoGLM-main")
 XHS_QUERY_CACHE_DIR = AUTOGLM_ROOT / "output" / "query_cache"
 FORCE_REFRESH_XHS_QUERY_CACHE = False
+SKIP_INGEST_ON_CACHE_HIT = True
+USE_EXISTING_GROUNDING_FILES = True
 if str(AUTOGLM_ROOT) not in sys.path:
     sys.path.insert(0, str(AUTOGLM_ROOT))
-from task import USER_QUERY
+from task import GROUNDING_TASK_TEMPLATE, TASK, USER_QUERY
+
+
+AUTOGLM_BROAD_OUTPUT_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "task": {"type": "string"},
+            "result": {"type": "string"},
+        },
+        "required": ["task", "result"],
+    },
+}
+
+AUTOGLM_GROUNDING_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "question": {"type": "string"},
+        "answer": {"type": "string"},
+        "summary": {"type": "string"},
+        "evidence": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "search_term": {"type": "string"},
+                    "route_module": {"type": "string"},
+                    "metric": {"type": "string"},
+                    "value": {"type": ["number", "null"]},
+                    "unit": {"type": "string"},
+                    "direction": {"type": "string"},
+                    "snippet": {"type": "string"},
+                },
+                "required": [
+                    "search_term",
+                    "route_module",
+                    "metric",
+                    "value",
+                    "unit",
+                    "direction",
+                    "snippet",
+                ],
+            },
+        },
+    },
+    "required": ["question", "answer", "summary", "evidence"],
+}
+
+AUTOGLM_GROUNDING_TIMEOUT_SEC = 900
+AUTOGLM_GROUNDING_IDLE_TIMEOUT_SEC = 300
+AUTOGLM_GROUNDING_MAX_SEARCH_PHRASES = 5
+AUTOGLM_GROUNDING_MAX_POSTS = 10
+
+
+def create_autoglm_run_dir(*, prefix: str = "run") -> Path:
+    output_dir = AUTOGLM_ROOT / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = output_dir / f"{prefix}_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
 
 
 KNOWN_XHS_DESTINATIONS = (
@@ -336,20 +408,11 @@ def _init_mem0_client() -> None:
     mem0_client = Memory.from_config(mem0_config)
 
 
-def _make_mem0_client(*, enable_graph: bool) -> Memory:
-    cfg = json.loads(json.dumps(mem0_config))
-    if not enable_graph:
-        cfg.pop("graph_store", None)
-    client = Memory.from_config(cfg)
-    client.enable_graph = bool(enable_graph)
-    return client
-
-
 def _get_xhs_mem0_client() -> Memory:
-    global xhs_mem0_client
-    if xhs_mem0_client is None:
-        xhs_mem0_client = _make_mem0_client(enable_graph=True)
-    return xhs_mem0_client
+    cfg = json.loads(json.dumps(mem0_config))
+    client = Memory.from_config(cfg)
+    client.enable_graph = True
+    return client
 
 
 def _load_autoglm_result_texts(json_path: Path) -> List[str]:
@@ -386,6 +449,8 @@ def _load_autoglm_result_texts(json_path: Path) -> List[str]:
 def run_autoglm_bash_script(
     *,
     extra_args: Optional[List[str]] = None,
+    timeout_sec: Optional[int] = None,
+    idle_timeout_sec: Optional[int] = None,
 ) -> int:
     """Run ``bash run_autoglm.sh`` under :data:`AUTOGLM_ROOT` (sets up PATH, Python, env).
 
@@ -408,8 +473,171 @@ def run_autoglm_bash_script(
         if raw:
             cmd.extend(shlex.split(raw))
     logger.info("run_autoglm.sh: cwd=%s %s", root, " ".join(cmd))
-    proc = subprocess.run(cmd, cwd=str(root))
-    return proc.returncode
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    start_time = time.time()
+    last_output_time = start_time
+    try:
+        while True:
+            if proc.poll() is not None:
+                break
+            ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+            if ready:
+                line = proc.stdout.readline()
+                if line:
+                    print(line, end="", file=sys.stderr, flush=True)
+                    last_output_time = time.time()
+            now = time.time()
+            if timeout_sec is not None and now - start_time > timeout_sec:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                raise TimeoutError(f"AutoGLM exceeded total timeout {timeout_sec}s")
+            if idle_timeout_sec is not None and now - last_output_time > idle_timeout_sec:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                raise TimeoutError(f"AutoGLM exceeded idle timeout {idle_timeout_sec}s")
+        for line in proc.stdout:
+            if line:
+                print(line, end="", file=sys.stderr, flush=True)
+        return proc.returncode
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+
+
+def create_autoglm_output_json_path(*, prefix: str = "autoglm_run") -> Path:
+    output_dir = AUTOGLM_ROOT / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return output_dir / f"{prefix}_{timestamp}.json"
+
+
+def resolve_autoglm_grounding_cache_path(task_instruction: str) -> Path:
+    output_dir = AUTOGLM_ROOT / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cache_key = hashlib.sha256(task_instruction.encode("utf-8")).hexdigest()[:16]
+    return output_dir / f"autoglm_grounding_{cache_key}.json"
+
+
+def load_cached_autoglm_grounding_result(
+    *,
+    task_instruction: str,
+) -> Optional[Dict[str, Any]]:
+    cache_path = resolve_autoglm_grounding_cache_path(task_instruction)
+    if not cache_path.is_file():
+        return None
+    try:
+        with cache_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as exc:
+        logger.warning("Failed to load cached grounding json %s: %s", cache_path, exc)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    raw_result = payload.get("raw_result")
+    if not isinstance(raw_result, str) or not raw_result.strip():
+        return None
+    print(f"[能力求证] 命中 grounding 缓存：{cache_path}", flush=True)
+    return {
+        "json_path": cache_path,
+        "payload": payload,
+    }
+
+
+def load_existing_grounding_payloads() -> List[Dict[str, Any]]:
+    output_dir = AUTOGLM_ROOT / "output"
+    payloads: List[Dict[str, Any]] = []
+    for path in sorted(output_dir.glob("autoglm_grounding_*.json")):
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as exc:
+            logger.warning("Failed to load grounding payload %s: %s", path, exc)
+            continue
+        if not isinstance(payload, dict):
+            continue
+        query = str(payload.get("query") or "").strip()
+        raw_result = str(payload.get("raw_result") or "").strip()
+        if not query or not raw_result:
+            continue
+        payload["_json_path"] = str(path)
+        payloads.append(payload)
+    return payloads
+
+
+def run_autoglm_cli_task(
+    *,
+    task_instruction: str,
+    output_json_path: Path,
+    search_query: str = "",
+    output_schema: Optional[Dict[str, Any]] = None,
+    timeout_sec: Optional[int] = None,
+    idle_timeout_sec: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Call Open-AutoGLM via CLI with explicit structured parameters."""
+    output_json_path = Path(output_json_path).expanduser().resolve()
+    cmd_args: List[str] = [
+        "--task-instruction",
+        task_instruction,
+        "--output-json",
+        str(output_json_path),
+    ]
+    if search_query.strip():
+        cmd_args.extend(["--search-query", search_query.strip()])
+    if output_schema:
+        cmd_args.extend(
+            ["--output-schema", json.dumps(output_schema, ensure_ascii=False)]
+        )
+    code = run_autoglm_bash_script(
+        extra_args=cmd_args,
+        timeout_sec=timeout_sec,
+        idle_timeout_sec=idle_timeout_sec,
+    )
+    if code != 0:
+        raise SystemExit(code)
+    if not output_json_path.is_file():
+        raise FileNotFoundError(f"AutoGLM output JSON not found: {output_json_path}")
+    with output_json_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    return {
+        "json_path": output_json_path,
+        "payload": payload,
+    }
+
+
+def build_grounding_task_instruction(
+    *,
+    question: str,
+    destination: str,
+    profile_signature: Dict[str, Any],
+) -> str:
+    profile_text = json.dumps(profile_signature, ensure_ascii=False)
+    base = GROUNDING_TASK_TEMPLATE.format(
+        question=question,
+        destination=destination or "",
+        profile_signature=profile_text,
+    )
+    return (
+        f"{base}\n"
+        "额外执行预算：\n"
+        f"1. 最多尝试 {AUTOGLM_GROUNDING_MAX_SEARCH_PHRASES} 组搜索表达。\n"
+        f"2. 总浏览帖子数不超过 {AUTOGLM_GROUNDING_MAX_POSTS} 篇。\n"
+        "3. 一旦已经有足够证据能够回答问题，就立即停止继续搜索。\n"
+        "4. 如果证据仍不足，请输出 uncertain，不要无限继续尝试。"
+    )
 
 
 def _resolve_autoglm_output_json_path(output_dir: Path, since: float) -> Path:
@@ -422,15 +650,6 @@ def _resolve_autoglm_output_json_path(output_dir: Path, since: float) -> Path:
     fresh = [p for p in files if p.stat().st_mtime >= since - 1.0]
     pool = fresh if fresh else files
     return max(pool, key=lambda p: p.stat().st_mtime)
-
-
-def _latest_autoglm_json_in_output_dir(output_dir: Path) -> Optional[Path]:
-    """Newest ``autoglm_run_*.json`` by mtime, or None if none exist."""
-    files = list(output_dir.glob("autoglm_run_*.json"))
-    if not files:
-        return None
-    return max(files, key=lambda p: p.stat().st_mtime)
-
 
 def _normalize_query_for_cache(user_query: str) -> str:
     return re.sub(r"\s+", " ", (user_query or "").strip())
@@ -498,13 +717,16 @@ def get_or_create_xhs_query_result_json(
         }
 
     output_dir = AUTOGLM_ROOT / "output"
-    t0 = time.time()
     print("[小红书查询] 未命中缓存，开始调用 Open-AutoGLM 在线检索小红书。", flush=True)
-    code = run_autoglm_bash_script()
-    if code != 0:
-        raise SystemExit(code)
-
-    latest_json = _resolve_autoglm_output_json_path(output_dir, t0)
+    latest_json = create_autoglm_output_json_path(prefix="autoglm_run")
+    run_autoglm_cli_task(
+        task_instruction=TASK,
+        search_query=user_query,
+        output_schema=AUTOGLM_BROAD_OUTPUT_SCHEMA,
+        output_json_path=latest_json,
+    )
+    if not latest_json.is_file():
+        latest_json = _resolve_autoglm_output_json_path(output_dir, time.time())
     cached_json = save_xhs_query_cache(
         source_json=latest_json,
         user_query=user_query,
@@ -522,10 +744,7 @@ def get_or_create_xhs_query_result_json(
 
 def add_autoglm_result_to_mem0(
     json_path: Optional[Path] = None,
-    *,
     mem0_client_override: Optional[Memory] = None,
-    run_open_autoglm_first: bool = False,
-    extra_argv: Optional[List[str]] = None,
     user_id: str = USER_ID,
     metadata: Optional[Dict[str, Any]] = None,
     write_vector: bool = True,
@@ -537,11 +756,7 @@ def add_autoglm_result_to_mem0(
 ) -> Dict[str, Any]:
     """Load AutoGLM output JSON into raw vector memory and the structured XHS graph.
 
-    If ``run_open_autoglm_first`` is True, runs :func:`run_autoglm_bash_script`, then picks the
-    newest matching ``output/autoglm_run_*.json`` from that run, then ingests. In that case
-    ``json_path`` is ignored.
-
-    Otherwise, if ``json_path`` is omitted, use the **newest** ``autoglm_run_*.json`` under
+    if ``json_path`` is omitted, use the **newest** ``autoglm_run_*.json`` under
     ``AUTOGLM_ROOT/output``. If that directory has no matches, fall back to
     :data:`AUTOGLM_RESULT_PATH`.
 
@@ -554,35 +769,7 @@ def add_autoglm_result_to_mem0(
     write_legacy_graph = write_legacy_graph or _env_flag("MEM0_XHS_LEGACY_GRAPH")
     cluster_play_modes = cluster_play_modes and not _env_flag("MEM0_XHS_SKIP_CLUSTER")
 
-    if run_open_autoglm_first:
-        output_dir = AUTOGLM_ROOT / "output"
-        t0 = time.time()
-        code = run_autoglm_bash_script(extra_args=extra_argv)
-        if code != 0:
-            raise RuntimeError(f"run_autoglm.sh exited with code {code}")
-        resolved = _resolve_autoglm_output_json_path(output_dir, t0)
-        logger.info("Ingesting AutoGLM JSON into mem0: %s", resolved)
-        json_path = resolved
-    else:
-        if json_path is not None:
-            json_path = Path(json_path).expanduser().resolve()
-        else:
-            latest = _latest_autoglm_json_in_output_dir(AUTOGLM_ROOT / "output")
-            if latest is not None:
-                json_path = latest
-                logger.info("Using latest AutoGLM JSON: %s", json_path)
-            else:
-                fb = Path(AUTOGLM_RESULT_PATH).expanduser().resolve()
-                if not fb.is_file():
-                    raise FileNotFoundError(
-                        f"No autoglm_run_*.json under {AUTOGLM_ROOT / 'output'} and "
-                        f"AUTOGLM_RESULT_PATH not found: {fb}"
-                    )
-                logger.warning(
-                    "No autoglm_run_*.json in %s; falling back to AUTOGLM_RESULT_PATH",
-                    AUTOGLM_ROOT / "output",
-                )
-                json_path = fb
+    json_path = Path(json_path).expanduser().resolve()
 
     print(f"[小红书入库] 读取 AutoGLM 结果文件：{json_path}", flush=True)
     result_texts = _load_autoglm_result_texts(json_path)
@@ -601,9 +788,7 @@ def add_autoglm_result_to_mem0(
 
     responses: List[Any] = []
     n = len(result_texts)
-    ingest_client = mem0_client_override or _make_mem0_client(
-        enable_graph=write_structured_graph or write_legacy_graph
-    )
+    ingest_client = mem0_client_override
     vector_inserted_count = 0
     if write_vector:
         print("[小红书入库] 开始写入向量记忆。", flush=True)
@@ -633,7 +818,6 @@ def add_autoglm_result_to_mem0(
     structured_result: Dict[str, Any] = {}
     if write_structured_graph:
         print("[小红书入库] 开始写入结构化图谱并聚类玩法簇。", flush=True)
-        ingest_client.enable_graph = True
         structured_result = ingest_autoglm_json_to_structured_xhs_graph(
             json_path=json_path,
             mem0_client=ingest_client,
@@ -653,6 +837,43 @@ def add_autoglm_result_to_mem0(
         "structured_graph": structured_result,
         "json_path": str(json_path),
     }
+
+
+def run_autoglm_grounding_question(
+    *,
+    question_text: str,
+    destination: str,
+    profile_signature: Dict[str, Any],
+) -> Optional[str]:
+    """Run one grounding question through Open-AutoGLM without fixed search-query."""
+    try:
+        task_instruction = build_grounding_task_instruction(
+            question=question_text,
+            destination=destination,
+            profile_signature=profile_signature,
+        )
+        result = load_cached_autoglm_grounding_result(
+            task_instruction=task_instruction,
+        )
+        if result is None:
+            output_json = resolve_autoglm_grounding_cache_path(task_instruction)
+            result = run_autoglm_cli_task(
+                task_instruction=task_instruction,
+                output_schema=AUTOGLM_GROUNDING_OUTPUT_SCHEMA,
+                output_json_path=output_json,
+                timeout_sec=AUTOGLM_GROUNDING_TIMEOUT_SEC,
+                idle_timeout_sec=AUTOGLM_GROUNDING_IDLE_TIMEOUT_SEC,
+            )
+        payload = result.get("payload")
+        if isinstance(payload, dict):
+            raw_result = payload.get("raw_result")
+            if isinstance(raw_result, str) and raw_result.strip():
+                return raw_result
+    except TimeoutError as exc:
+        print(f"[能力求证] AutoGLM grounding 超时，回退本地求证：{exc}", flush=True)
+    except Exception as exc:
+        print(f"[能力求证] AutoGLM grounding 失败，回退本地求证：{exc}", flush=True)
+    return None
 
 
 def parse_xhs_task_request(user_query: str) -> Dict[str, Any]:
@@ -693,7 +914,7 @@ def _parse_xhs_trip_days(user_query: str) -> int:
         return max(1, _chinese_number_to_int(chinese_day_match.group(1)))
     if "周末" in user_query:
         return 2
-    return 3
+    return 1
 
 
 def _chinese_number_to_int(value: str) -> int:
@@ -717,28 +938,6 @@ def _chinese_number_to_int(value: str) -> int:
         ones = digits.get(right, 0) if right else 0
         return tens * 10 + ones
     return digits.get(value, 3)
-
-
-def _collect_match_places(matches: List[MatchResult], destination: str) -> List[str]:
-    places: List[str] = []
-    for match in matches:
-        raw = match.raw or {}
-        for place in raw.get("representative_places") or []:
-            text = str(place).strip()
-            if text:
-                places.append(text)
-        if not places:
-            places.extend(_places_from_play_mode_name(match.name))
-    if not places and destination:
-        places.append(destination)
-    seen = set()
-    out = []
-    for place in places:
-        if place in seen:
-            continue
-        seen.add(place)
-        out.append(place)
-    return out[:8]
 
 
 def _structured_result_summary_for_print(result: Dict[str, Any]) -> str:
@@ -774,35 +973,16 @@ def _profile_summary_for_print(profile: Any) -> str:
     return "；".join(parts)
 
 
-def _constraint_intent_summary_for_print(intent: Any) -> str:
-    travelers = []
-    for traveler in getattr(intent, "travelers", []) or []:
-        role = getattr(traveler, "role", "unknown")
-        age = getattr(traveler, "age", None)
-        count = getattr(traveler, "count", 1)
-        mobility = getattr(traveler, "mobility", "unknown")
-        label = role
-        if age is not None:
-            label += f":{age}岁"
-        if count and count > 1:
-            label += f"x{count}"
-        if mobility != "unknown":
-            label += f"/{mobility}"
-        travelers.append(label)
-    intent_ids = [getattr(item, "id", "") for item in getattr(intent, "constraint_intents", []) or []]
-    tradeoffs = [getattr(item, "id", "") for item in getattr(intent, "tradeoffs", []) or []]
-    tag_parts = []
-    for field in ("profile_tags", "need_tags", "preference_tags", "risk_tags"):
-        values = [str(item) for item in getattr(intent, field, []) or [] if item]
-        if values:
-            tag_parts.append(f"{field}={','.join(values)}")
+def _demand_graph_summary_for_print(graph: Any) -> str:
+    claim_metrics = [str(getattr(item, "metric", "")) for item in getattr(graph, "claims", []) or [] if getattr(item, "metric", "")]
+    questions = getattr(graph, "retrieval_questions", []) or []
+    tradeoffs = getattr(graph, "tradeoffs", []) or []
     return (
-        f"画像={','.join(travelers) or '未识别'}；"
-        f"节奏={getattr(intent, 'pace', 'unknown')}；"
-        f"预算={getattr(intent, 'budget', 'unknown')}；"
-        f"标签={'；'.join(tag_parts) or '无'}；"
-        f"约束={','.join(item for item in intent_ids if item) or '无'}；"
-        f"取舍={','.join(item for item in tradeoffs if item) or '无'}"
+        f"节奏={getattr(graph, 'pace', 'unknown')}；"
+        f"预算={getattr(graph, 'budget', 'unknown')}；"
+        f"claims={','.join(claim_metrics[:8]) or '无'}；"
+        f"检索问题={len(questions)}；"
+        f"取舍={','.join(str(item) for item in tradeoffs[:3]) or '无'}"
     )
 
 
@@ -814,26 +994,6 @@ def _match_summary_for_print(matches: List[MatchResult]) -> str:
     ordered = ["pass", "conditional", "unknown", "fail"]
     body = "，".join(f"{key}={counts.get(key, 0)}" for key in ordered)
     return f"总数={len(matches)}，{body}"
-
-
-def _observation_summary_for_print(observations: List[Any]) -> str:
-    fields = {
-        "步行距离": "walk_km",
-        "连续步行": "continuous_walk_min",
-        "游玩时长": "activity_duration_min",
-        "台阶": "stairs_steps",
-        "爬升": "elevation_gain_m",
-        "排队": "queue_time_min",
-    }
-    parts = [f"总数={len(observations)}"]
-    for label, field in fields.items():
-        count = sum(1 for obs in observations if getattr(obs, field, None) is not None)
-        parts.append(f"{label}={count}")
-    transport_count = sum(
-        1 for obs in observations if getattr(obs, "transport_mode", "unknown") not in {"", "unknown"}
-    )
-    parts.append(f"交通替代={transport_count}")
-    return "，".join(parts)
 
 
 def _format_limit_for_print(label: str, limit: Any) -> str:
@@ -851,23 +1011,6 @@ def _format_limit_for_print(label: str, limit: Any) -> str:
     confidence_text = f"，置信度={confidence:.2f}" if isinstance(confidence, float) else ""
     evidence_text = f"，证据数={evidence_count}" if isinstance(evidence_count, int) else ""
     return f"{label}: soft={soft}{unit}, hard={hard}{unit}{confidence_text}{evidence_text}{source_text}"
-
-
-def _capability_estimate_summary_for_print(estimate: Any) -> str:
-    if estimate is None:
-        return "无可用能力估计"
-    parts = [
-        f"整体置信度={getattr(estimate, 'confidence', 0.0):.2f}",
-        f"使用观测={getattr(estimate, 'observations_used', 0)}",
-        _format_limit_for_print("每日步行", estimate.daily_walk_km),
-        _format_limit_for_print("连续步行", estimate.continuous_walk_min),
-        _format_limit_for_print("台阶", estimate.stairs_steps),
-        _format_limit_for_print("爬升", estimate.elevation_gain_m),
-    ]
-    mitigations = getattr(estimate, "mitigation_effects", {}) or {}
-    if mitigations:
-        parts.append("省力交通效果=" + ",".join(f"{key}:{value}" for key, value in mitigations.items()))
-    return "；".join(parts)
 
 
 def _active_constraints_summary_for_print(active: Any) -> str:
@@ -911,12 +1054,16 @@ def run_xhs_full_itinerary_flow(
 ) -> Dict[str, Any]:
     if not destination:
         raise ValueError(f"Could not parse destination from USER_QUERY: {user_query}")
+    #固定规则解析用户画像
+    # todo：模型拆解或其他方式
     profile = parse_traveler_profile(user_query)
     print(f"[行程生成] 解析用户画像：{_profile_summary_for_print(profile)}", flush=True)
     graph_client = mem0_client_override or _get_xhs_mem0_client()
     graph_client.enable_graph = True
     runner = Mem0Neo4jQueryRunner(graph_client)
+    capability_writer = CapabilityGraphWriter(runner)
     print(f"[玩法簇匹配] 开始从本地图谱查询目的地「{destination}」的候选玩法簇。", flush=True)
+    #大模型比对profile和玩法簇
     matches = query_matching_play_modes(
         query_runner=runner,
         run_id="xhs",
@@ -927,114 +1074,98 @@ def run_xhs_full_itinerary_flow(
         limit=max(10, trip_days * 3),
     )
     print(f"[玩法簇匹配] 匹配完成：{_match_summary_for_print(matches)}", flush=True)
-    generation_context: Dict[str, Any] = {"mode": "constraint_aware"}
+    generation_context: Dict[str, Any] = {"mode": "play_mode_capability_planning"}
     try:
-        catalog = RuleCatalog.load_default()
-        constraint_intent = interpret_constraint_intent(
+        demand_graph = infer_demand_graph(
             user_query=user_query,
             destination=destination,
-            trip_days=trip_days,
             traveler_profile=profile,
         )
-        print(f"[约束识别] 识别结果：{_constraint_intent_summary_for_print(constraint_intent)}", flush=True)
-        candidate_places_for_evidence = _collect_match_places(matches, destination)
-        print(
-            f"[能力证据] 将从本轮小红书 JSON 中抽取能力约束证据，聚焦景点：{', '.join(candidate_places_for_evidence) or destination}",
-            flush=True,
+        print(f"[语义解释] 需求图生成完成：{_demand_graph_summary_for_print(demand_graph)}", flush=True)
+        profile_signature = build_profile_signature(
+            demand_graph=demand_graph,
+            traveler_profile=profile,
         )
-        capability_observations = []
-        current_capability_estimate = estimate_profile_capability(
-            observations=[],
-            intent=constraint_intent,
-            destination=destination,
-        )
-        historical_capability_estimate = None
-        evidence_json_path = (autoglm_ingest_result or {}).get("json_path")
-        if evidence_json_path:
-            print(f"[能力证据] 开始从已有小红书结果抽取能力证据：{evidence_json_path}", flush=True)
-            capability_observations = extract_capability_observations_from_json(
-                json_path=Path(evidence_json_path),
-                destination=destination,
-                intent=constraint_intent,
-                candidate_places=candidate_places_for_evidence,
-                catalog=catalog,
-            )
-            print(f"[能力证据] 抽取完成：{_observation_summary_for_print(capability_observations)}", flush=True)
-            current_capability_estimate = estimate_profile_capability(
-                observations=capability_observations,
-                intent=constraint_intent,
-                destination=destination,
-            )
-            print(f"[能力估计] 本轮小红书估计：{_capability_estimate_summary_for_print(current_capability_estimate)}", flush=True)
-        else:
-            print("[能力证据] 未找到 AutoGLM JSON 路径，跳过能力证据抽取。", flush=True)
-
-        try:
-            historical_capability_estimate = load_capability_estimate(
-                query_runner=runner,
-                profile_bucket=current_capability_estimate.profile_bucket,
-                destination=destination,
-            )
-            if historical_capability_estimate is not None:
-                print(
-                    f"[能力图谱] 读取到历史能力估计：{_capability_estimate_summary_for_print(historical_capability_estimate)}",
-                    flush=True,
-                )
-            else:
-                print("[能力图谱] 未读取到可用历史能力估计。", flush=True)
-        except Exception as exc:
-            logger.warning("Loading capability estimate from graph failed: %s", exc)
-            print(f"[能力图谱] 读取历史能力估计失败，继续使用本轮估计：{exc}", flush=True)
-
-        capability_estimate = merge_capability_estimates(
-            current_capability_estimate,
-            historical_capability_estimate,
-        )
-        print(f"[能力估计] 最终用于约束的能力估计：{_capability_estimate_summary_for_print(capability_estimate)}", flush=True)
-
-        try:
-            capability_writer = CapabilityGraphWriter(runner)
-            capability_writer.ensure_schema()
-            observation_write = capability_writer.write_observations(
-                observations=capability_observations,
-                profile_bucket=(capability_estimate or current_capability_estimate).profile_bucket,
-                run_id="xhs",
-            )
-            limit_write = capability_writer.write_estimate(
-                estimate=capability_estimate or current_capability_estimate,
-                observations=capability_observations,
-                run_id="xhs",
+        if USE_EXISTING_GROUNDING_FILES:
+            grounding_payloads = load_existing_grounding_payloads()
+            capability_questions, capability_answers = load_answers_from_existing_grounding_payloads(
+                grounding_payloads=grounding_payloads,
             )
             print(
-                "[能力图谱] 写入完成："
-                f"观测指标={observation_write.get('observation_metric_count', 0)}，"
-                f"能力边界={limit_write.get('capability_limit_count', 0)}。",
+                f"[能力问题] 画像={profile_signature.readable_name or '当前画像'}；复用已有 grounding 文件={len(capability_questions)}",
                 flush=True,
             )
-        except Exception as exc:
-            logger.warning("Writing capability estimate to graph failed: %s", exc)
-            print(f"[能力图谱] 写入失败，但不影响本次行程生成：{exc}", flush=True)
+        else:
+            capability_questions = generate_capability_questions(
+                demand_graph=demand_graph,
+                profile_signature=profile_signature,
+            )
+            print(
+                f"[能力问题] 画像={profile_signature.readable_name or '当前画像'}；问题数={len(capability_questions)}",
+                flush=True,
+            )
 
-        active_constraints = resolve_constraints(
-            constraint_intent,
-            catalog,
-            capability_estimate=capability_estimate,
-        )
-        print(f"[约束生效] 当前硬/软约束：{_active_constraints_summary_for_print(active_constraints)}", flush=True)
-        candidates = build_candidates_from_matches(
-            matches=matches,
+        evidence_json_path = (autoglm_ingest_result or {}).get("json_path")
+        posts = []
+        if evidence_json_path:
+            posts = load_autoglm_posts(Path(evidence_json_path), run_id="xhs")
+            print(f"[证据对齐] 已载入小红书帖子：{len(posts)} 条。", flush=True)
+        else:
+            print("[证据对齐] 未找到 AutoGLM JSON 路径，将仅依据 query 与图谱结果生成约束。", flush=True)
+
+        if not USE_EXISTING_GROUNDING_FILES:
+            capability_answers = run_capability_grounding(
+                user_query=user_query,
+                destination=destination,
+                profile_signature=profile_signature,
+                capability_questions=capability_questions,
+                posts=posts,
+                play_mode_matches=matches,
+                autoglm_runner=lambda question: run_autoglm_grounding_question(
+                    question_text=question.question,
+                    destination=destination,
+                    profile_signature=profile_signature.model_dump(),
+                ),
+            )
+        print(f"[能力求证] 问题回答完成：{summarize_capability_grounding(capability_answers)}", flush=True)
+        capability_observations = parse_capability_observations(answers=capability_answers)
+        print(f"[能力观测] 生成细粒度观测：{len(capability_observations)} 条。", flush=True)
+        capability_estimate = calibrate_capability_estimate(
+            observations=capability_observations,
+            profile_signature=profile_signature,
             destination=destination,
-            constraints=active_constraints,
-            catalog=catalog,
         )
-        print(f"[候选构建] 候选路线数量：{len(candidates)}", flush=True)
-        scored_candidates = score_candidates(
-            candidates=candidates,
-            constraints=active_constraints,
+        print(f"[能力边界] {summarize_capability_estimate(capability_estimate)}", flush=True)
+        planning_budget = build_planning_budget(
+            estimate=capability_estimate,
+            demand_graph=demand_graph,
         )
-        print(f"[候选评分] {_candidate_score_summary_for_print(scored_candidates)}", flush=True)
-        skeleton = optimize_itinerary(
-            scored_candidates=scored_candidates,
+        print(f"[规划预算] {summarize_planning_budget(planning_budget)}", flush=True)
+        active_constraints = planning_budget_to_constraints(
+            planning_budget=planning_budget,
+            demand_graph=demand_graph,
+        )
+        capability_writer.write_questions(profile_signature, capability_questions)
+        capability_writer.write_observations(capability_questions, capability_observations)
+        capability_writer.write_estimate(profile_signature, capability_estimate, capability_observations)
+
+        play_mode_fits = build_play_mode_fits(
+            query_runner=runner,
+            matches=matches,
+            planning_budget=planning_budget,
+        )
+        capability_writer.write_playmode_fits(capability_estimate, play_mode_fits)
+        print(f"[玩法拟合] {summarize_play_mode_fits(play_mode_fits)}", flush=True)
+
+        scored_play_modes = score_play_modes(
+            play_mode_fits=play_mode_fits,
+            planning_budget=planning_budget,
+        )
+        print(f"[候选评分] {summarize_scored_play_modes(scored_play_modes)}", flush=True)
+
+        skeleton = optimize_itinerary_from_play_modes(
+            scored_play_modes=scored_play_modes,
+            planning_budget=planning_budget,
             constraints=active_constraints,
             destination=destination,
             trip_days=trip_days,
@@ -1050,12 +1181,16 @@ def run_xhs_full_itinerary_flow(
         print(f"[行程校验] 发现问题数量：{len(validation_report.issues)}", flush=True)
         generation_context.update(
             {
-                "constraint_intent": _model_to_dict(constraint_intent),
-                "capability_observations": [_model_to_dict(obs) for obs in capability_observations],
-                "capability_estimate": _model_to_dict(capability_estimate) if capability_estimate is not None else None,
+                "demand_graph": _model_to_dict(demand_graph),
+                "profile_signature": _model_to_dict(profile_signature),
+                "capability_questions": [_model_to_dict(item) for item in capability_questions],
+                "capability_grounding_answers": [_model_to_dict(item) for item in capability_answers],
+                "capability_observations": [_model_to_dict(item) for item in capability_observations],
+                "capability_estimate": _model_to_dict(capability_estimate),
+                "planning_budget": _model_to_dict(planning_budget),
                 "active_constraints": _model_to_dict(active_constraints),
-                "candidates": [_model_to_dict(candidate) for candidate in candidates],
-                "scored_candidates": [_model_to_dict(candidate) for candidate in scored_candidates],
+                "play_mode_fits": [_model_to_dict(item) for item in play_mode_fits],
+                "scored_play_modes": [_model_to_dict(item) for item in scored_play_modes],
                 "itinerary_skeleton": _model_to_dict(skeleton),
                 "validation_report": _model_to_dict(validation_report),
             }
@@ -1249,10 +1384,13 @@ def _model_to_dict(value: Any) -> Any:
     return value
 
 
-def _prepare_mem0_runtime() -> None:
+def _prepare_mem0_runtime(client: Optional[Memory] = None) -> None:
     # 群聊启动前准备 mem0：清空本地 Qdrant 集合，再把用户评论预载进向量库。
+    runtime_client = client or mem0_client
+    if runtime_client is None:
+        raise RuntimeError("_prepare_mem0_runtime() requires an initialized mem0 client.")
     logger.info("Resetting local Qdrant collection (mem0 vector_store.reset) ...")
-    vector_store = mem0_client.vector_store
+    vector_store = runtime_client.vector_store
     reset = getattr(vector_store, "reset", None)
     if callable(reset):
         reset()
@@ -1265,7 +1403,7 @@ def _prepare_mem0_runtime() -> None:
         file=sys.stderr,
         flush=True,
     )
-    preload_reviews(mem0_client, reviews_path=REVIEWS_PATH, user_id=USER_ID)
+    preload_reviews(runtime_client, reviews_path=REVIEWS_PATH, user_id=USER_ID)
 
 
 def _resolve_state_from_city(city: str) -> Optional[str]:
@@ -2676,9 +2814,10 @@ def print_last_vector_store_memories(
 def main() -> None:
     global mem0_client, _available_states, _city_to_state, _city_lower_to_state
 
-    log_dir = Path(__file__).resolve().parent / "logs"
+    run_dir = create_autoglm_run_dir(prefix="main_mem0")
+    os.environ["AUTOGLM_RUN_OUTPUT_DIR"] = str(run_dir)
     # stdout + logging.INFO 共用 stdout_log.stdout_to_log_file 打开的单一文件句柄
-    with stdout_to_log_file(log_dir, prefix="main_mem0"):
+    with stdout_to_log_file(run_dir, prefix="main_mem0"):
         runtime_stats.reset()
         _install_openai_usage_patch()
         _quiet_third_party_loggers()
@@ -2724,13 +2863,17 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    _prepare_mem0_runtime()
+    xhs_client = _get_xhs_mem0_client()
+    # _prepare_mem0_runtime(xhs_client)
     # main()
-    with stdout_to_log_file(AUTOGLM_ROOT / "output", prefix="main_mem0_xhs"):
+    run_dir = create_autoglm_run_dir(prefix="main_mem0_xhs")
+    os.environ["AUTOGLM_RUN_OUTPUT_DIR"] = str(run_dir)
+    with stdout_to_log_file(run_dir, prefix="main_mem0_xhs"):
         runtime_stats.reset()
         _install_openai_usage_patch()
         _quiet_third_party_loggers()
-        task_request = parse_xhs_task_request(USER_QUERY)
+        #1. 解析任务请求
+        task_request = parse_xhs_task_request(USER_QUERY)   
         print(
             "XHS task parsed: "
             f"destination={task_request['destination']}, "
@@ -2738,28 +2881,40 @@ if __name__ == "__main__":
             f"user_query={task_request['user_query']}",
             flush=True,
         )
+        #2. 获取或创建xhs查询
         query_result = get_or_create_xhs_query_result_json(
             user_query=task_request["user_query"],
             destination=task_request["destination"],
             trip_days=task_request["trip_days"],
         )
-        xhs_client = _get_xhs_mem0_client()
-        ingest_result = add_autoglm_result_to_mem0(
-            json_path=query_result["json_path"],
-            mem0_client_override=xhs_client,
-            destination=task_request["destination"],
-            metadata={
-                "query_cache_key": query_result["cache_key"],
-                "query_cache_hit": query_result["cache_hit"],
-                "user_query": task_request["user_query"],
-            },
-            write_vector=True,
-            vector_infer=False,
-            write_legacy_graph=False,
-            write_structured_graph=True,
-            cluster_play_modes=True,
-        )
+        #3. 将查询结果添加到向量数据库 / 图数据库（命中缓存时可跳过重复入库）
+        if SKIP_INGEST_ON_CACHE_HIT and query_result["cache_hit"]:
+            print(
+                "[小红书入库] 命中缓存，跳过重复入库与聚类，直接复用已有 JSON 和图数据。",
+                flush=True,
+            )
+            ingest_result = {
+                "json_path": str(query_result["json_path"]),
+                "vector_inserted_count": 0,
+            }
+        else:
+            ingest_result = add_autoglm_result_to_mem0(
+                json_path=query_result["json_path"],
+                mem0_client_override=xhs_client,
+                destination=task_request["destination"],
+                metadata={
+                    "query_cache_key": query_result["cache_key"],
+                    "query_cache_hit": query_result["cache_hit"],
+                    "user_query": task_request["user_query"],
+                },
+                write_vector=True,
+                vector_infer=False,
+                write_legacy_graph=False,
+                write_structured_graph=True,
+                cluster_play_modes=True,
+            )
         try:
+            #4. 约束式行程生成
             run_xhs_full_itinerary_flow(
                 user_query=task_request["user_query"],
                 destination=task_request["destination"],

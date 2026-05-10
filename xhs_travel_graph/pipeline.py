@@ -68,12 +68,9 @@ def ingest_autoglm_json_to_structured_xhs_graph(
     destination: str = "",
     write_schema: bool = True,
     cluster_play_modes: bool = True,
-    extraction_limit: Optional[int] = None,
     llm_client: Optional[Any] = None,
 ) -> Dict[str, Any]:
     posts = load_autoglm_posts(Path(json_path), run_id=run_id)
-    if extraction_limit is not None:
-        posts = posts[:extraction_limit]
 
     extractor = XHSTravelFactExtractor(llm_client or OpenAILLMClient())
     facts_by_post = {}

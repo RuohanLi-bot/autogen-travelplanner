@@ -7,11 +7,7 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 from .graph_repository import QueryRunner
 from .normalizer import stable_id
 
-try:
-    import networkx as nx
-except ImportError:  # pragma: no cover - exercised only when dependency is missing.
-    nx = None
-
+import networkx as nx
 
 class XHSPlayModeClusterer:
     def __init__(self, query_runner: QueryRunner):
@@ -84,7 +80,7 @@ class XHSPlayModeClusterer:
     def detect_communities(self, rows: List[Dict[str, Any]]) -> List[List[str]]:
         if not rows:
             return []
-        if nx is None or len(rows) == 1:
+        if len(rows) == 1:
             return [[row["id"]] for row in rows if row.get("id")]
         graph = build_route_similarity_graph(rows)
         if graph.number_of_edges() == 0:
@@ -163,8 +159,6 @@ class XHSPlayModeClusterer:
 
 
 def build_route_similarity_graph(route_rows: List[Dict[str, Any]]):
-    if nx is None:
-        raise RuntimeError("networkx is required for route similarity graph construction")
     graph = nx.Graph()
     for row in route_rows:
         if row.get("id"):
