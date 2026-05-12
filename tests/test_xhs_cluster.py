@@ -8,7 +8,6 @@ def test_route_similarity_uses_explainable_features():
         "segments": [{"from_place": "天子山", "to_place": "袁家界", "transport_mode": "cable_car"}],
         "requirements": [{"requirement_type": "mobility"}],
         "risks": [{"risk_type": "fatigue", "severity": "low"}],
-        "mitigations": [{"mitigation_type": "transport_substitution"}],
     }
     b = {
         "places": ["天子山", "袁家界"],
@@ -16,7 +15,6 @@ def test_route_similarity_uses_explainable_features():
         "segments": [{"from_place": "天子山", "to_place": "袁家界", "transport_mode": "cable_car"}],
         "requirements": [{"requirement_type": "mobility"}],
         "risks": [{"risk_type": "fatigue", "severity": "low"}],
-        "mitigations": [{"mitigation_type": "transport_substitution"}],
     }
 
     weight, reasons = route_similarity(a, b)

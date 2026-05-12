@@ -31,7 +31,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -77,6 +77,7 @@ from graph_builder import (
     prepare_state_graph_data,
 )
 from preload_memories import preload_reviews
+from poi_research.llm_client import OpenAILLMClient
 from poi_research import POIStructuredInfo, process_pois
 from critic_rules import evaluate_itinerary, validate_timed_itinerary
 
@@ -85,6 +86,7 @@ from runtime_stats import runtime_stats
 from xhs_travel_graph.graph_repository import Mem0Neo4jQueryRunner
 from xhs_travel_graph.matcher import query_matching_play_modes
 from xhs_travel_graph.models import MatchResult
+from xhs_travel_graph.normalizer import stable_id
 from xhs_travel_graph.pipeline import ingest_autoglm_json_to_structured_xhs_graph
 from xhs_travel_graph.post_parser import load_autoglm_posts
 from xhs_travel_graph.profile_parser import parse_traveler_profile
@@ -103,10 +105,11 @@ from xhs_constraints.constraint_calibrator import (
     summarize_planning_budget,
 )
 from xhs_constraints.final_writer import write_final_itinerary
+from xhs_constraints.models import CapabilityEstimate, MetricLimit
 from xhs_constraints.optimizer import optimize_itinerary_from_play_modes
-from xhs_constraints.playmode_fits import build_play_mode_fits, summarize_play_mode_fits
+from xhs_constraints.playmode_fits import build_play_mode_fits, format_play_mode_fit_details, summarize_play_mode_fits
 from xhs_constraints.query_semantics import build_profile_signature, generate_capability_questions, infer_demand_graph
-from xhs_constraints.scorer import score_play_modes, summarize_scored_play_modes
+from xhs_constraints.scorer import format_scored_play_mode_details, score_play_modes, summarize_scored_play_modes
 from xhs_constraints.validator import validate_final_itinerary
 
 logger = logging.getLogger(__name__)
@@ -442,7 +445,6 @@ def _load_autoglm_result_texts(json_path: Path) -> List[str]:
         if isinstance(result, str) and result.strip():
             return [result.strip()]
         raise ValueError(f"'result' is missing or empty in {json_path}")
-
     raise ValueError(f"Unexpected JSON shape in {json_path}; expected object or array")
 
 
@@ -559,7 +561,7 @@ def load_cached_autoglm_grounding_result(
 
 def load_existing_grounding_payloads() -> List[Dict[str, Any]]:
     output_dir = AUTOGLM_ROOT / "output"
-    payloads: List[Dict[str, Any]] = []
+    best_by_query: Dict[str, Dict[str, Any]] = {}
     for path in sorted(output_dir.glob("autoglm_grounding_*.json")):
         try:
             with path.open("r", encoding="utf-8") as f:
@@ -574,8 +576,371 @@ def load_existing_grounding_payloads() -> List[Dict[str, Any]]:
         if not query or not raw_result:
             continue
         payload["_json_path"] = str(path)
-        payloads.append(payload)
-    return payloads
+        payload["_quality"] = _grounding_payload_quality(query, raw_result)
+        current = best_by_query.get(query)
+        if current is None or float(payload["_quality"]) >= float(current.get("_quality") or 0.0):
+            best_by_query[query] = payload
+    return list(best_by_query.values())
+
+
+def _grounding_payload_quality(query: str, raw_result: str) -> float:
+    text = raw_result or ""
+    score = 0.0
+    score += min(len(text), 2400) / 240.0
+    score += 4.0 * len(re.findall(r"\d+(?:\.\d+)?\s*(?:公里|km|小时|h|分钟|min|步|级台阶|级阶)", text, re.I))
+    score += 3.0 * len(re.findall(r"\d+\s*[-~到至]\s*\d+\s*(?:公里|km|小时|h|分钟|min|步|级台阶|级阶)", text, re.I))
+    score += 1.5 * sum(1 for token in ("索道", "缆车", "电梯", "扶梯", "环保车", "景交车", "小火车") if token in text)
+    score += 1.5 * sum(1 for token in ("排队", "拥挤", "错峰", "步行", "步数", "台阶", "爬升") if token in text)
+    if any(token in text for token in ("AI助手", "问一问", "基于34篇笔记")):
+        score -= 8.0
+    if "相似画像游客" in query:
+        score += 2.0 * len(re.findall(r"(?:步|公里|小时|分钟|台阶|阶梯)", text))
+    return score
+
+
+def find_cached_xhs_query_result_for_destination(destination: str) -> Optional[Dict[str, Any]]:
+    destination = (destination or "").strip()
+    if not destination:
+        return None
+    best_meta: Optional[Dict[str, Any]] = None
+    best_meta_path: Optional[Path] = None
+    for meta_path in sorted(XHS_QUERY_CACHE_DIR.glob("*.meta.json")):
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to load query cache meta %s: %s", meta_path, exc)
+            continue
+        if not isinstance(meta, dict):
+            continue
+        if str(meta.get("destination") or "").strip() != destination:
+            continue
+        if best_meta is None or str(meta.get("created_at") or "") >= str(best_meta.get("created_at") or ""):
+            best_meta = meta
+            best_meta_path = meta_path
+    if best_meta is None or best_meta_path is None:
+        return None
+    cached_json = Path(str(best_meta.get("cached_json") or "")).expanduser()
+    if not cached_json.is_file():
+        return None
+    return {
+        "json_path": cached_json,
+        "cache_hit": True,
+        "cache_key": str(best_meta.get("cache_key") or ""),
+        "cache_reused_by_destination": True,
+        "meta_path": str(best_meta_path),
+    }
+
+
+class _UnavailableLLMClient:
+    def available(self) -> bool:
+        return False
+
+
+def _build_reuse_semantic_seed(
+    *,
+    user_query: str,
+    destination: str,
+    traveler_profile: Any,
+) -> tuple[Any, Any]:
+    no_llm = _UnavailableLLMClient()
+    demand_graph = infer_demand_graph(
+        user_query=user_query,
+        destination=destination,
+        traveler_profile=traveler_profile,
+        llm_client=no_llm,
+    )
+    profile_signature = build_profile_signature(
+        demand_graph=demand_graph,
+        traveler_profile=traveler_profile,
+        llm_client=no_llm,
+    )
+    return demand_graph, profile_signature
+
+
+def _build_travel_persona_descriptor(
+    *,
+    user_id: str,
+    profile_signature: Any,
+) -> Dict[str, Any]:
+    signature = profile_signature.signature if hasattr(profile_signature, "signature") else {}
+    roles = [str(item).strip() for item in signature.get("companion_roles") or ["unknown"] if str(item).strip()]
+    role_key = "_".join(sorted(set(roles))) or "unknown"
+    mobility_level = str(signature.get("mobility_level") or "unknown")
+    pace = str(signature.get("pace") or "unknown")
+    budget_sensitivity = str(signature.get("budget_sensitivity") or "unknown")
+    senior_age_band = str(signature.get("senior_age_band") or "unknown")
+    child_age_band = str(signature.get("child_age_band") or "unknown")
+    persona_key = "|".join(
+        [
+            role_key,
+            f"mobility={mobility_level}",
+            f"pace={pace}",
+            f"budget={budget_sensitivity}",
+            f"senior={senior_age_band}",
+            f"child={child_age_band}",
+        ]
+    )
+    return {
+        "id": stable_id("travel_persona", user_id, persona_key),
+        "persona_key": persona_key,
+        "role_key": role_key,
+        "mobility_level": mobility_level,
+        "pace": pace,
+        "budget_sensitivity": budget_sensitivity,
+        "senior_age_band": senior_age_band,
+        "child_age_band": child_age_band,
+        "companion_roles": roles,
+        "readable_name": getattr(profile_signature, "readable_name", "") or role_key,
+    }
+
+
+def _infer_activity_type_descriptor(
+    *,
+    persona: Optional[Dict[str, Any]] = None,
+    destination: str,
+    user_query: str,
+    demand_graph: Any,
+    profile_signature: Any,
+) -> Dict[str, Any]:
+    text = f"{destination} {user_query}".lower()
+    facets = [str(item).strip() for item in getattr(profile_signature, "signature", {}).get("query_facets") or [] if str(item).strip()]
+    if any(token in text for token in ("张家界", "黄山", "泰山", "华山", "庐山", "山", "徒步", "爬山", "爬升", "台阶", "索道")):
+        activity_key = "mountain_sightseeing"
+        label = "山地观景/轻徒步"
+    elif any(token in text for token in ("迪士尼", "环球", "乐园", "游乐场", "主题公园")):
+        activity_key = "theme_park"
+        label = "主题公园"
+    elif any(token in text for token in ("博物馆", "展馆", "美术馆", "故宫")):
+        activity_key = "museum_culture"
+        label = "博物馆/人文参观"
+    elif any(token in text for token in ("海边", "沙滩", "海岛", "三亚", "鼓浪屿")):
+        activity_key = "coastal_leisure"
+        label = "海滨休闲"
+    else:
+        activity_key = "general_sightseeing"
+        label = "综合观光"
+    persona_id = str((persona or {}).get("id") or "global")
+    return {
+        "id": stable_id("activity_type", persona_id, destination, activity_key),
+        "activity_key": activity_key,
+        "destination": destination,
+        "label": label,
+        "facets": facets,
+    }
+
+
+def _persona_activity_reuse_summary(persona: Dict[str, Any], activity: Dict[str, Any], dimensions: List[Dict[str, Any]]) -> str:
+    groups = sorted({str(item.get("group") or "") for item in dimensions if str(item.get("group") or "").strip()})
+    return (
+        f"persona={persona.get('readable_name') or persona.get('role_key')}"
+        f"；activity={activity.get('activity_key')}"
+        f"；维度数={len(dimensions)}"
+        f"；groups={','.join(groups) or '无'}"
+    )
+
+
+def _llm_extract_persona_dimensions(
+    *,
+    user_query: str,
+    destination: str,
+    profile_signature: Any,
+    capability_estimate: CapabilityEstimate,
+    planning_budget: Any,
+) -> List[Dict[str, Any]]:
+    client = OpenAILLMClient()
+    fallback = _fallback_extract_persona_dimensions(
+        profile_signature=profile_signature,
+        capability_estimate=capability_estimate,
+        planning_budget=planning_budget,
+    )
+    if not getattr(client, "available", lambda: False)():
+        return fallback
+    system_prompt = (
+        "你是旅行画像偏好维度抽取器。"
+        "请把当前画像与能力边界，压缩成少量可复用的偏好维度节点。"
+        "只允许输出 group 为 strength, budget, comfort, rhythm。"
+        "strength 用于步行距离、连续步行时长、台阶、活动时长；"
+        "budget 用于预算等级；comfort 用于排队时长等舒适度限制；rhythm 用于节奏相关离散值。"
+        "不要输出 playmode、routevariant、same_day_relation 等路线/玩法节点信息。"
+        '输出 JSON object，格式为 {"dimensions":[{"group":"","metric":"","soft_limit":null,"hard_limit":null,"unit":"","value_text":"","confidence":0.0,"source":"grounded"}]}。'
+        "如果某个维度是数值型，尽量填写 soft_limit/hard_limit；如果是离散型，填写 value_text。"
+    )
+    payload = {
+        "destination": destination,
+        "user_query": user_query,
+        "profile_signature": _model_to_dict(profile_signature),
+        "capability_estimate": _model_to_dict(capability_estimate),
+        "planning_budget": _model_to_dict(planning_budget),
+        "fallback_dimensions": fallback,
+    }
+    result = client.generate_json(
+        system_prompt=system_prompt,
+        user_prompt=str(payload),
+        temperature=0.0,
+        default={},
+    )
+    dimensions = result.get("dimensions") if isinstance(result, dict) else None
+    if not isinstance(dimensions, list):
+        return fallback
+    out: List[Dict[str, Any]] = []
+    for item in dimensions:
+        if not isinstance(item, dict):
+            continue
+        group = str(item.get("group") or "").strip().lower()
+        metric = str(item.get("metric") or "").strip()
+        if group not in {"strength", "budget", "comfort", "rhythm"} or not metric:
+            continue
+        out.append(
+            {
+                "group": group,
+                "metric": metric,
+                "soft_limit": item.get("soft_limit"),
+                "hard_limit": item.get("hard_limit"),
+                "unit": str(item.get("unit") or ""),
+                "value_text": str(item.get("value_text") or ""),
+                "confidence": float(item.get("confidence") or 0.0),
+                "source": str(item.get("source") or "grounded"),
+            }
+        )
+    return out or fallback
+
+
+def _fallback_extract_persona_dimensions(
+    *,
+    profile_signature: Any,
+    capability_estimate: CapabilityEstimate,
+    planning_budget: Any,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    group_map = {
+        "walk_distance": "strength",
+        "continuous_walk_time": "strength",
+        "stairs_steps": "strength",
+        "active_duration": "strength",
+        "queue_exposure": "comfort",
+    }
+    for item in capability_estimate.metric_limits:
+        group = group_map.get(item.metric)
+        if not group:
+            continue
+        out.append(
+            {
+                "group": group,
+                "metric": item.metric,
+                "soft_limit": item.soft_limit,
+                "hard_limit": item.hard_limit,
+                "unit": item.unit,
+                "value_text": "",
+                "confidence": item.confidence,
+                "source": "grounded",
+            }
+        )
+    budget_level = str(getattr(planning_budget, "budget_level", "") or "")
+    if budget_level and budget_level != "unknown":
+        out.append(
+            {
+                "group": "budget",
+                "metric": "budget_level",
+                "soft_limit": None,
+                "hard_limit": None,
+                "unit": "",
+                "value_text": budget_level,
+                "confidence": 0.7,
+                "source": "query+grounded",
+            }
+        )
+    pace = str(getattr(profile_signature, "signature", {}).get("pace") or "")
+    if pace and pace != "unknown":
+        out.append(
+            {
+                "group": "rhythm",
+                "metric": "pace",
+                "soft_limit": None,
+                "hard_limit": None,
+                "unit": "",
+                "value_text": pace,
+                "confidence": 0.6,
+                "source": "query",
+            }
+        )
+    return out
+
+
+def _estimate_from_persona_dimensions(
+    *,
+    destination: str,
+    profile_signature_id: str,
+    dimensions: Sequence[Dict[str, Any]],
+) -> CapabilityEstimate:
+    metric_limits: List[MetricLimit] = []
+    notes = ["loaded_from_persona_dimensions"]
+    confidence_values: List[float] = []
+    metric_map = {
+        "walk_distance": "walk_distance",
+        "continuous_walk_time": "continuous_walk_time",
+        "stairs_steps": "stairs_steps",
+        "active_duration": "active_duration",
+        "queue_exposure": "queue_exposure",
+    }
+    for item in dimensions:
+        if not isinstance(item, dict):
+            continue
+        metric = metric_map.get(str(item.get("metric") or "").strip())
+        if not metric:
+            continue
+        confidence = float(item.get("confidence") or 0.0)
+        confidence_values.append(confidence)
+        metric_limits.append(
+            MetricLimit(
+                metric=metric,
+                scenario="default",
+                soft_limit=item.get("soft_limit"),
+                hard_limit=item.get("hard_limit"),
+                unit=str(item.get("unit") or ""),
+                confidence=confidence,
+                evidence_count=0,
+                notes=[f"persona_group={str(item.get('group') or '')}"],
+            )
+        )
+    return CapabilityEstimate(
+        estimate_id=stable_id("persona_dimension_estimate", profile_signature_id, destination),
+        destination=destination,
+        profile_signature_id=profile_signature_id,
+        metric_limits=metric_limits,
+        forbidden_same_day_pairs=[],
+        discouraged_same_day_pairs=[],
+        preferred_tags={},
+        notes=notes,
+        confidence=(sum(confidence_values) / len(confidence_values)) if confidence_values else 0.0,
+    )
+
+
+def _apply_persona_dimension_overrides(
+    *,
+    demand_graph: Any,
+    profile_signature: Any,
+    dimensions: Sequence[Dict[str, Any]],
+) -> None:
+    budget_value = next(
+        (
+            str(item.get("value_text") or "").strip()
+            for item in dimensions
+            if str(item.get("group") or "").strip() == "budget" and str(item.get("metric") or "").strip() == "budget_level"
+        ),
+        "",
+    )
+    if budget_value and getattr(demand_graph, "budget", "unknown") == "unknown":
+        demand_graph.budget = budget_value
+    pace_value = next(
+        (
+            str(item.get("value_text") or "").strip()
+            for item in dimensions
+            if str(item.get("group") or "").strip() == "rhythm" and str(item.get("metric") or "").strip() == "pace"
+        ),
+        "",
+    )
+    if pace_value and getattr(demand_graph, "pace", "unknown") == "unknown":
+        demand_graph.pace = pace_value
 
 
 def run_autoglm_cli_task(
@@ -744,100 +1109,65 @@ def get_or_create_xhs_query_result_json(
 
 def add_autoglm_result_to_mem0(
     json_path: Optional[Path] = None,
-    mem0_client_override: Optional[Memory] = None,
+    mem0_client: Optional[Memory] = None,
     user_id: str = USER_ID,
     metadata: Optional[Dict[str, Any]] = None,
-    write_vector: bool = True,
     vector_infer: bool = False,
-    write_legacy_graph: bool = False,
     write_structured_graph: bool = True,
-    cluster_play_modes: bool = True,
     destination: str = "",
 ) -> Dict[str, Any]:
-    """Load AutoGLM output JSON into raw vector memory and the structured XHS graph.
-
-    if ``json_path`` is omitted, use the **newest** ``autoglm_run_*.json`` under
-    ``AUTOGLM_ROOT/output``. If that directory has no matches, fall back to
-    :data:`AUTOGLM_RESULT_PATH`.
-
-    By default, raw Xiaohongshu text is added to Qdrant with ``infer=False`` and the tourism
-    graph is written through the schema-bound ``xhs_travel_graph`` pipeline. The older mem0
-    generic graph extraction can still be enabled with ``write_legacy_graph=True`` or
-    ``MEM0_XHS_LEGACY_GRAPH=1``.
     """
-    write_structured_graph = write_structured_graph and not _env_flag("MEM0_XHS_DISABLE_STRUCTURED_GRAPH")
-    write_legacy_graph = write_legacy_graph or _env_flag("MEM0_XHS_LEGACY_GRAPH")
-    cluster_play_modes = cluster_play_modes and not _env_flag("MEM0_XHS_SKIP_CLUSTER")
-
+    把帖子文本写进向量库、抽成结构化图写入 Neo4j：RouteVariant、Place、Constraint、Risk、RouteSegment
+    把多个 RouteVariant 聚类成PlayMode玩法簇
+    """
     json_path = Path(json_path).expanduser().resolve()
-
     print(f"[小红书入库] 读取 AutoGLM 结果文件：{json_path}", flush=True)
     result_texts = _load_autoglm_result_texts(json_path)
     ingest_run_id = "xhs"
     print(f"[小红书入库] 待处理帖子/结果条数：{len(result_texts)}", flush=True)
 
-    base_meta: Dict[str, Any] = {
-        "source": "autoglm_result",
-        "source_file": str(json_path),
-        "ingest_field": "result",
-        "graph_label": "xhs",
-        "timestamp": int(time.time()),
-    }
-    if metadata:
-        base_meta.update(metadata)
+    # base_meta: Dict[str, Any] = {
+    #     "source": "autoglm_result",
+    #     "source_file": str(json_path),
+    #     "ingest_field": "result",
+    #     "graph_label": "xhs",
+    #     "timestamp": int(time.time()),
+    # }
+    # if metadata:
+    #     base_meta.update(metadata)
 
-    responses: List[Any] = []
-    n = len(result_texts)
-    ingest_client = mem0_client_override
-    vector_inserted_count = 0
-    if write_vector:
-        print("[小红书入库] 开始写入向量记忆。", flush=True)
-        original_enable_graph = bool(getattr(ingest_client, "enable_graph", False))
-        ingest_client.enable_graph = bool(write_legacy_graph)
-        try:
-            for idx, result_text in enumerate(result_texts):
-                chunk_meta = {
-                    **base_meta,
-                    "result_index": idx,
-                    "result_count": n,
-                }
-                r = ingest_client.add(
-                    messages=[{"role": "user", "content": result_text}],
-                    user_id=user_id,
-                    run_id=ingest_run_id,
-                    metadata=chunk_meta,
-                    infer=vector_infer,
-                )
-                responses.append(r)
-                vector_inserted_count += 1
-        finally:
-            ingest_client.enable_graph = original_enable_graph
-        print(f"[小红书入库] 向量记忆写入完成：{len(responses)} 条。", flush=True)
-        print(f"[向量数据库] 本次新增数据：{vector_inserted_count} 条。", flush=True)
+    # responses: List[Any] = []
+    # n = len(result_texts)
+    # print("[小红书入库] 开始写入向量和图数据库。", flush=True)
+    # for idx, result_text in enumerate(result_texts):
+    #     chunk_meta = {
+    #         **base_meta,
+    #         "result_index": idx,
+    #         "result_count": n,
+    #     }
+    #     r = mem0_client.add(
+    #         messages=[{"role": "user", "content": result_text}],
+    #         user_id=user_id,
+    #         run_id=ingest_run_id,
+    #         metadata=chunk_meta,
+    #         infer=vector_infer,
+    #     )
+    #     responses.append(r)
+    # print(f"[向量数据库] 本次新增数据：{len(responses)} 条。", flush=True)
 
     structured_result: Dict[str, Any] = {}
     if write_structured_graph:
         print("[小红书入库] 开始写入结构化图谱并聚类玩法簇。", flush=True)
         structured_result = ingest_autoglm_json_to_structured_xhs_graph(
             json_path=json_path,
-            mem0_client=ingest_client,
+            mem0_client=mem0_client,
             run_id=ingest_run_id,
             destination=destination,
-            cluster_play_modes=cluster_play_modes,
         )
         print(
             f"[小红书入库] 结构化图谱处理完成：{_structured_result_summary_for_print(structured_result)}",
             flush=True,
         )
-
-    return {
-        "responses": responses,
-        "count": len(responses),
-        "vector_inserted_count": vector_inserted_count,
-        "structured_graph": structured_result,
-        "json_path": str(json_path),
-    }
-
 
 def run_autoglm_grounding_question(
     *,
@@ -914,7 +1244,7 @@ def _parse_xhs_trip_days(user_query: str) -> int:
         return max(1, _chinese_number_to_int(chinese_day_match.group(1)))
     if "周末" in user_query:
         return 2
-    return 1
+    return 2
 
 
 def _chinese_number_to_int(value: str) -> int:
@@ -1076,66 +1406,123 @@ def run_xhs_full_itinerary_flow(
     print(f"[玩法簇匹配] 匹配完成：{_match_summary_for_print(matches)}", flush=True)
     generation_context: Dict[str, Any] = {"mode": "play_mode_capability_planning"}
     try:
-        demand_graph = infer_demand_graph(
+        probe_demand_graph, probe_profile_signature = _build_reuse_semantic_seed(
             user_query=user_query,
             destination=destination,
             traveler_profile=profile,
         )
-        print(f"[语义解释] 需求图生成完成：{_demand_graph_summary_for_print(demand_graph)}", flush=True)
-        profile_signature = build_profile_signature(
-            demand_graph=demand_graph,
-            traveler_profile=profile,
+        persona_descriptor = _build_travel_persona_descriptor(
+            user_id=USER_ID,
+            profile_signature=probe_profile_signature,
         )
-        if USE_EXISTING_GROUNDING_FILES:
-            grounding_payloads = load_existing_grounding_payloads()
-            capability_questions, capability_answers = load_answers_from_existing_grounding_payloads(
-                grounding_payloads=grounding_payloads,
-            )
-            print(
-                f"[能力问题] 画像={profile_signature.readable_name or '当前画像'}；复用已有 grounding 文件={len(capability_questions)}",
-                flush=True,
-            )
-        else:
-            capability_questions = generate_capability_questions(
-                demand_graph=demand_graph,
-                profile_signature=profile_signature,
-            )
-            print(
-                f"[能力问题] 画像={profile_signature.readable_name or '当前画像'}；问题数={len(capability_questions)}",
-                flush=True,
-            )
-
-        evidence_json_path = (autoglm_ingest_result or {}).get("json_path")
-        posts = []
-        if evidence_json_path:
-            posts = load_autoglm_posts(Path(evidence_json_path), run_id="xhs")
-            print(f"[证据对齐] 已载入小红书帖子：{len(posts)} 条。", flush=True)
-        else:
-            print("[证据对齐] 未找到 AutoGLM JSON 路径，将仅依据 query 与图谱结果生成约束。", flush=True)
-
-        if not USE_EXISTING_GROUNDING_FILES:
-            capability_answers = run_capability_grounding(
-                user_query=user_query,
-                destination=destination,
-                profile_signature=profile_signature,
-                capability_questions=capability_questions,
-                posts=posts,
-                play_mode_matches=matches,
-                autoglm_runner=lambda question: run_autoglm_grounding_question(
-                    question_text=question.question,
-                    destination=destination,
-                    profile_signature=profile_signature.model_dump(),
-                ),
-            )
-        print(f"[能力求证] 问题回答完成：{summarize_capability_grounding(capability_answers)}", flush=True)
-        capability_observations = parse_capability_observations(answers=capability_answers)
-        print(f"[能力观测] 生成细粒度观测：{len(capability_observations)} 条。", flush=True)
-        capability_estimate = calibrate_capability_estimate(
-            observations=capability_observations,
-            profile_signature=profile_signature,
+        activity_descriptor = _infer_activity_type_descriptor(
+            persona=persona_descriptor,
+            destination=destination,
+            user_query=user_query,
+            demand_graph=probe_demand_graph,
+            profile_signature=probe_profile_signature,
+        )
+        reused_dimensions = capability_writer.load_user_persona_dimensions(
+            user_id=USER_ID,
+            persona_key=str(persona_descriptor.get("persona_key") or ""),
+            activity_key=str(activity_descriptor.get("activity_key") or ""),
             destination=destination,
         )
-        print(f"[能力边界] {summarize_capability_estimate(capability_estimate)}", flush=True)
+        capability_questions: List[Any] = []
+        capability_answers: List[Any] = []
+        capability_observations: List[Any] = []
+        preference_reuse_hit = False
+        if reused_dimensions:
+            preference_reuse_hit = True
+            demand_graph = probe_demand_graph
+            profile_signature = probe_profile_signature
+            _apply_persona_dimension_overrides(
+                demand_graph=demand_graph,
+                profile_signature=profile_signature,
+                dimensions=reused_dimensions,
+            )
+            capability_estimate = _estimate_from_persona_dimensions(
+                destination=destination,
+                profile_signature_id=profile_signature.signature_id,
+                dimensions=reused_dimensions,
+            )
+            capability_writer.write_profile_signature(profile_signature)
+            capability_writer.write_estimate(profile_signature, capability_estimate, [])
+            generation_context.update(
+                {
+                    "preference_reuse_hit": True,
+                    "persona_descriptor": persona_descriptor,
+                    "activity_descriptor": activity_descriptor,
+                    "persona_dimensions": reused_dimensions,
+                }
+            )
+            print(
+                f"[画像复用] 命中图偏好：{_persona_activity_reuse_summary(persona_descriptor, activity_descriptor, reused_dimensions)}",
+                flush=True,
+            )
+            print(f"[语义解释] 复用 fallback 需求图：{_demand_graph_summary_for_print(demand_graph)}", flush=True)
+            print(f"[能力边界] {summarize_capability_estimate(capability_estimate)}", flush=True)
+        else:
+            demand_graph = infer_demand_graph(
+                user_query=user_query,
+                destination=destination,
+                traveler_profile=profile,
+            )
+            print(f"[语义解释] 需求图生成完成：{_demand_graph_summary_for_print(demand_graph)}", flush=True)
+            profile_signature = build_profile_signature(
+                demand_graph=demand_graph,
+                traveler_profile=profile,
+            )
+            if USE_EXISTING_GROUNDING_FILES:
+                grounding_payloads = load_existing_grounding_payloads()
+                capability_questions, capability_answers = load_answers_from_existing_grounding_payloads(
+                    grounding_payloads=grounding_payloads,
+                )
+                print(
+                    f"[能力问题] 画像={profile_signature.readable_name or '当前画像'}；复用已有 grounding 文件={len(capability_questions)}",
+                    flush=True,
+                )
+            else:
+                capability_questions = generate_capability_questions(
+                    demand_graph=demand_graph,
+                    profile_signature=profile_signature,
+                )
+                print(
+                    f"[能力问题] 画像={profile_signature.readable_name or '当前画像'}；问题数={len(capability_questions)}",
+                    flush=True,
+                )
+
+            evidence_json_path = (autoglm_ingest_result or {}).get("json_path")
+            posts = []
+            if evidence_json_path:
+                posts = load_autoglm_posts(Path(evidence_json_path), run_id="xhs")
+                print(f"[证据对齐] 已载入小红书帖子：{len(posts)} 条。", flush=True)
+            else:
+                print("[证据对齐] 未找到 AutoGLM JSON 路径，将仅依据 query 与图谱结果生成约束。", flush=True)
+
+            if not USE_EXISTING_GROUNDING_FILES:
+                capability_answers = run_capability_grounding(
+                    user_query=user_query,
+                    destination=destination,
+                    profile_signature=profile_signature,
+                    capability_questions=capability_questions,
+                    posts=posts,
+                    play_mode_matches=matches,
+                    autoglm_runner=lambda question: run_autoglm_grounding_question(
+                        question_text=question.question,
+                        destination=destination,
+                        profile_signature=profile_signature.model_dump(),
+                    ),
+                )
+            print(f"[能力求证] 问题回答完成：{summarize_capability_grounding(capability_answers)}", flush=True)
+            capability_observations = parse_capability_observations(answers=capability_answers)
+            print(f"[能力观测] 生成细粒度观测：{len(capability_observations)} 条。", flush=True)
+            capability_estimate = calibrate_capability_estimate(
+                observations=capability_observations,
+                profile_signature=profile_signature,
+                destination=destination,
+            )
+            print(f"[能力边界] {summarize_capability_estimate(capability_estimate)}", flush=True)
         planning_budget = build_planning_budget(
             estimate=capability_estimate,
             demand_graph=demand_graph,
@@ -1145,9 +1532,26 @@ def run_xhs_full_itinerary_flow(
             planning_budget=planning_budget,
             demand_graph=demand_graph,
         )
-        capability_writer.write_questions(profile_signature, capability_questions)
-        capability_writer.write_observations(capability_questions, capability_observations)
-        capability_writer.write_estimate(profile_signature, capability_estimate, capability_observations)
+        if capability_questions:
+            capability_writer.write_questions(profile_signature, capability_questions)
+        if capability_observations:
+            capability_writer.write_observations(capability_questions, capability_observations)
+        if not preference_reuse_hit:
+            capability_writer.write_estimate(profile_signature, capability_estimate, capability_observations)
+            persona_dimensions = _llm_extract_persona_dimensions(
+                user_query=user_query,
+                destination=destination,
+                profile_signature=profile_signature,
+                capability_estimate=capability_estimate,
+                planning_budget=planning_budget,
+            )
+            generation_context["persona_dimensions"] = persona_dimensions
+            capability_writer.write_user_persona_dimensions(
+                user_id=USER_ID,
+                persona=persona_descriptor,
+                activity=activity_descriptor,
+                dimensions=persona_dimensions,
+            )
 
         play_mode_fits = build_play_mode_fits(
             query_runner=runner,
@@ -1156,12 +1560,14 @@ def run_xhs_full_itinerary_flow(
         )
         capability_writer.write_playmode_fits(capability_estimate, play_mode_fits)
         print(f"[玩法拟合] {summarize_play_mode_fits(play_mode_fits)}", flush=True)
+        print(format_play_mode_fit_details(play_mode_fits), flush=True)
 
         scored_play_modes = score_play_modes(
             play_mode_fits=play_mode_fits,
             planning_budget=planning_budget,
         )
         print(f"[候选评分] {summarize_scored_play_modes(scored_play_modes)}", flush=True)
+        print(format_scored_play_mode_details(scored_play_modes), flush=True)
 
         skeleton = optimize_itinerary_from_play_modes(
             scored_play_modes=scored_play_modes,
@@ -2882,36 +3288,44 @@ if __name__ == "__main__":
             flush=True,
         )
         #2. 获取或创建xhs查询
-        query_result = get_or_create_xhs_query_result_json(
-            user_query=task_request["user_query"],
-            destination=task_request["destination"],
-            trip_days=task_request["trip_days"],
-        )
-        #3. 将查询结果添加到向量数据库 / 图数据库（命中缓存时可跳过重复入库）
-        if SKIP_INGEST_ON_CACHE_HIT and query_result["cache_hit"]:
-            print(
-                "[小红书入库] 命中缓存，跳过重复入库与聚类，直接复用已有 JSON 和图数据。",
-                flush=True,
-            )
-            ingest_result = {
-                "json_path": str(query_result["json_path"]),
-                "vector_inserted_count": 0,
-            }
+        exact_cache_path = resolve_xhs_query_cache_path(task_request["user_query"])
+        if USE_EXISTING_GROUNDING_FILES and not exact_cache_path.is_file():
+            fallback_query_result = find_cached_xhs_query_result_for_destination(task_request["destination"])
+            if fallback_query_result is not None:
+                print(
+                    "[小红书查询] 半降级模式启用：当前 query 无精确缓存，复用同目的地已有缓存结果。"
+                    f" meta={fallback_query_result.get('meta_path', 'n/a')}",
+                    flush=True,
+                )
+                query_result = fallback_query_result
+            else:
+                query_result = get_or_create_xhs_query_result_json(
+                    user_query=task_request["user_query"],
+                    destination=task_request["destination"],
+                    trip_days=task_request["trip_days"],
+                )
         else:
-            ingest_result = add_autoglm_result_to_mem0(
+            query_result = get_or_create_xhs_query_result_json(
+                user_query=task_request["user_query"],
+                destination=task_request["destination"],
+                trip_days=task_request["trip_days"],
+            )
+        ingest_result = {
+            "json_path": str(query_result["json_path"]),
+        }
+        #3. 将查询结果添加到向量数据库 / 图数据库（命中缓存时可跳过重复入库）
+        if not (SKIP_INGEST_ON_CACHE_HIT and query_result["cache_hit"]):
+            add_autoglm_result_to_mem0(
                 json_path=query_result["json_path"],
-                mem0_client_override=xhs_client,
+                mem0_client=xhs_client,
                 destination=task_request["destination"],
                 metadata={
                     "query_cache_key": query_result["cache_key"],
                     "query_cache_hit": query_result["cache_hit"],
                     "user_query": task_request["user_query"],
                 },
-                write_vector=True,
                 vector_infer=False,
-                write_legacy_graph=False,
                 write_structured_graph=True,
-                cluster_play_modes=True,
             )
         try:
             #4. 约束式行程生成
@@ -2925,10 +3339,6 @@ if __name__ == "__main__":
         finally:
             stats = runtime_stats.snapshot()
             successful_llm_calls = stats["llm_call_count"] - stats["llm_failure_count"]
-            print(
-                f"[运行总结] 向量数据库本次新增：{ingest_result.get('vector_inserted_count', 0)} 条。",
-                flush=True,
-            )
             print(
                 f"[运行总结] 模型成功调用次数：{successful_llm_calls} 次。",
                 flush=True,

@@ -6,10 +6,8 @@ from typing import Iterable, List, Optional, Tuple
 
 from .models import (
     ConstraintFact,
-    MitigationFact,
     RequirementFact,
     RiskFact,
-    RouteAlternativeFact,
     RouteSegmentFact,
     RouteVariantFact,
 )
@@ -119,15 +117,10 @@ def normalize_route_variant(fact: RouteVariantFact) -> RouteVariantFact:
 
     for constraint in list(fact.constraints):
         _normalize_constraint(constraint)
-    for alternative in fact.alternatives:
-        for constraint in alternative.constraints:
-            _normalize_constraint(constraint)
 
     _add_facts_from_text(fact, fact.evidence_span)
-    _add_alternatives_from_text(fact, fact.evidence_span)
     for segment in fact.segments:
         _add_facts_from_text(fact, segment.evidence_span)
-        _add_alternatives_from_text(fact, segment.evidence_span)
 
     fact.style_tags = _dedupe_keep_order(tag.strip().lower().replace(" ", "_") for tag in fact.style_tags if tag)
     return fact
@@ -157,10 +150,6 @@ def requirement_id(route_variant_id: str, fact: RequirementFact) -> str:
 
 def risk_id(route_variant_id: str, fact: RiskFact) -> str:
     return stable_id(route_variant_id, "risk", fact.risk_type, fact.severity, fact.evidence_span)
-
-
-def mitigation_id(route_variant_id: str, fact: MitigationFact) -> str:
-    return stable_id(route_variant_id, "mitigation", fact.mitigation_type, fact.method, fact.extra_cost_cny, fact.evidence_span)
 
 
 def evidence_id(post_id: str, text: str) -> str:
@@ -247,18 +236,6 @@ def _add_facts_from_text(fact: RouteVariantFact, text: str) -> None:
                 evidence_span=text,
             ),
         )
-    mode = normalize_transport_mode(text)
-    if mode in {"escalator", "elevator", "cable_car", "shuttle_bus"}:
-        _append_unique_mitigation(
-            fact.mitigations,
-            MitigationFact(
-                mitigation_type="transport_substitution",
-                method=mode,
-                extra_cost_cny=money,
-                status="available",
-                evidence_span=text,
-            ),
-        )
     for token, (risk_type, severity) in RISK_HINTS.items():
         if token in text:
             _append_unique_risk(fact.risks, RiskFact(risk_type=risk_type, severity=severity, evidence_span=text))
@@ -278,104 +255,6 @@ def _add_facts_from_text(fact: RouteVariantFact, text: str) -> None:
         )
 
 
-def _add_alternatives_from_text(fact: RouteVariantFact, text: str) -> None:
-    if not text or "或" not in text:
-        return
-    stairs = parse_stairs_count(text)
-    money = parse_money_cny(text)
-    mode = normalize_transport_mode(text)
-    if stairs is None or money is None or mode not in {"escalator", "elevator", "cable_car", "shuttle_bus"}:
-        return
-    if any(alt.evidence_span == text and alt.option_name in {mode, "stairs"} for alt in fact.alternatives):
-        return
-
-    fact.alternatives.append(
-        RouteAlternativeFact(
-            option_name=mode,
-            constraints=[
-                ConstraintFact(
-                    metric="extra_cost_cny",
-                    value_num=money,
-                    value_text=str(money),
-                    unit="CNY",
-                    bound="exact",
-                    polarity="negative",
-                    evidence_span=text,
-                ),
-                ConstraintFact(
-                    metric="stairs",
-                    value_text="avoided",
-                    unit="steps",
-                    bound="unknown",
-                    polarity="positive",
-                    evidence_span=text,
-                ),
-            ],
-            mitigations=[
-                MitigationFact(
-                    mitigation_type="transport_substitution",
-                    method=mode,
-                    extra_cost_cny=money,
-                    status="available",
-                    evidence_span=text,
-                )
-            ],
-            evidence_span=text,
-        )
-    )
-    fact.alternatives.append(
-        RouteAlternativeFact(
-            option_name="stairs",
-            constraints=[
-                ConstraintFact(
-                    metric="extra_cost_cny",
-                    value_num=0,
-                    value_text="0",
-                    unit="CNY",
-                    bound="exact",
-                    polarity="positive",
-                    evidence_span=text,
-                ),
-                ConstraintFact(
-                    metric="stairs",
-                    value_num=float(stairs),
-                    value_text=str(stairs),
-                    unit="steps",
-                    bound="exact",
-                    polarity="negative",
-                    evidence_span=text,
-                ),
-                ConstraintFact(
-                    metric="physical_load_rank",
-                    value_num=4 if stairs >= 500 else 3,
-                    value_text="4" if stairs >= 500 else "3",
-                    unit="rank_1_4",
-                    bound="exact",
-                    polarity="negative",
-                    evidence_span=text,
-                ),
-            ],
-            requirements=[
-                RequirementFact(
-                    requirement_type="mobility",
-                    demand="climb_stairs",
-                    magnitude=float(stairs),
-                    unit="steps",
-                    evidence_span=text,
-                )
-            ],
-            risks=[
-                RiskFact(
-                    risk_type="fatigue",
-                    severity="high" if stairs >= 500 else "medium",
-                    evidence_span=text,
-                )
-            ],
-            evidence_span=text,
-        )
-    )
-
-
 def _append_unique_constraint(items: List[ConstraintFact], item: ConstraintFact) -> None:
     key = (item.metric, item.value_num, item.value_text, item.unit, item.evidence_span)
     if all((x.metric, x.value_num, x.value_text, x.unit, x.evidence_span) != key for x in items):
@@ -391,12 +270,6 @@ def _append_unique_requirement(items: List[RequirementFact], item: RequirementFa
 def _append_unique_risk(items: List[RiskFact], item: RiskFact) -> None:
     key = (item.risk_type, item.severity, item.evidence_span)
     if all((x.risk_type, x.severity, x.evidence_span) != key for x in items):
-        items.append(item)
-
-
-def _append_unique_mitigation(items: List[MitigationFact], item: MitigationFact) -> None:
-    key = (item.mitigation_type, item.method, item.extra_cost_cny, item.evidence_span)
-    if all((x.mitigation_type, x.method, x.extra_cost_cny, x.evidence_span) != key for x in items):
         items.append(item)
 
 

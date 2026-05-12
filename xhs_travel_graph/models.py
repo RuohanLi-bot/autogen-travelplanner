@@ -54,14 +54,6 @@ class RiskFact(BaseModel):
     evidence_span: str
 
 
-class MitigationFact(BaseModel):
-    mitigation_type: str
-    method: str = ""
-    extra_cost_cny: Optional[float] = None
-    status: Literal["available", "unavailable", "unknown"] = "unknown"
-    evidence_span: str
-
-
 class RouteSegmentFact(BaseModel):
     order: int
     from_place: str = ""
@@ -76,15 +68,6 @@ class RouteSegmentFact(BaseModel):
     evidence_span: str = ""
 
 
-class RouteAlternativeFact(BaseModel):
-    option_name: str
-    constraints: List[ConstraintFact] = Field(default_factory=list)
-    requirements: List[RequirementFact] = Field(default_factory=list)
-    risks: List[RiskFact] = Field(default_factory=list)
-    mitigations: List[MitigationFact] = Field(default_factory=list)
-    evidence_span: str
-
-
 class RouteVariantFact(BaseModel):
     route_variant_id: str
     post_id: str
@@ -93,11 +76,9 @@ class RouteVariantFact(BaseModel):
     destination: str = ""
     places: List[str] = Field(default_factory=list)
     segments: List[RouteSegmentFact] = Field(default_factory=list)
-    alternatives: List[RouteAlternativeFact] = Field(default_factory=list)
     constraints: List[ConstraintFact] = Field(default_factory=list)
     requirements: List[RequirementFact] = Field(default_factory=list)
     risks: List[RiskFact] = Field(default_factory=list)
-    mitigations: List[MitigationFact] = Field(default_factory=list)
     style_tags: List[str] = Field(default_factory=list)
     evidence_span: str
 

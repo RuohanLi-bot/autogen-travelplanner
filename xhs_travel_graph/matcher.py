@@ -30,7 +30,6 @@ def query_matching_play_modes(
         OPTIONAL MATCH (rv)-[:HAS_CONSTRAINT]->(c:Constraint)
         OPTIONAL MATCH (rv)-[:REQUIRES]->(req:Requirement)-[:SUPPORTED_BY]->(req_ev:Evidence)
         OPTIONAL MATCH (rv)-[:HAS_RISK]->(risk:Risk)-[:SUPPORTED_BY]->(risk_ev:Evidence)
-        OPTIONAL MATCH (rv)-[:HAS_MITIGATION]->(mit:Mitigation)-[:SUPPORTED_BY]->(mit_ev:Evidence)
         OPTIONAL MATCH (c)-[:SUPPORTED_BY]->(ev:Evidence)
         RETURN pm.id AS play_mode_id,
                pm.name AS name,
@@ -63,14 +62,7 @@ def query_matching_play_modes(
                    risk_type: risk.risk_type,
                    severity: risk.severity,
                    evidence: risk_ev.text
-               }) AS risks,
-               collect(DISTINCT {
-                   mitigation_type: mit.mitigation_type,
-                   method: mit.method,
-                   status: mit.status,
-                   extra_cost_cny: mit.extra_cost_cny,
-                   evidence: mit_ev.text
-               }) AS mitigations
+               }) AS risks
         """,
         {"run_id": run_id, "destination": destination},
     )
@@ -120,12 +112,12 @@ def match_play_modes(
         if include_blocked or (assessment.decision != "fail" and not blocked):
             results.append(result)
     results.sort(key=_sort_key)
-    return results[:limit]
+    return _dedupe_match_results(results)[:limit]
 
 
 def _normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(row)
-    for field in ("constraints", "requirements", "risks", "mitigations"):
+    for field in ("constraints", "requirements", "risks"):
         out[field] = _clean_dicts(row.get(field))
     out["style_tags"] = row.get("style_tags") or []
     out["route_variant_ids"] = [item for item in row.get("route_variant_ids", []) if item]
@@ -139,10 +131,6 @@ def _clean_dicts(value: Any) -> List[Dict[str, Any]]:
 
 
 def _unresolved_risk_count(row: Dict[str, Any]) -> int:
-    mitigations = _clean_dicts(row.get("mitigations"))
-    has_mitigation = any(item.get("status") == "available" for item in mitigations)
-    if has_mitigation:
-        return 0
     return sum(
         1
         for item in _clean_dicts(row.get("risks"))
@@ -161,6 +149,34 @@ def _sort_key(result: MatchResult):
         result.duration_max_min if result.duration_max_min is not None else 999999,
         -result.evidence_count,
     )
+
+
+def _dedupe_match_results(results: List[MatchResult]) -> List[MatchResult]:
+    seen = set()
+    deduped: List[MatchResult] = []
+    for result in results:
+        key = _match_semantic_key(result)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(result)
+    return deduped
+
+
+def _match_semantic_key(result: MatchResult):
+    raw = result.raw or {}
+    places = tuple(str(item).strip() for item in (raw.get("representative_places") or [])[:2] if str(item).strip())
+    modes = tuple(str(item).strip().lower() for item in (raw.get("dominant_transport_modes") or [])[:2] if str(item).strip())
+    style_tags = tuple(str(item).strip().lower() for item in (raw.get("style_tags") or [])[:3] if str(item).strip())
+    if places or modes or style_tags:
+        return (
+            str(raw.get("destination") or "").strip(),
+            places,
+            modes,
+            style_tags,
+            str(result.name or "").strip(),
+        )
+    return (str(result.name or "").strip(),)
 
 
 def _as_float(value: Any) -> Optional[float]:

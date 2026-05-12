@@ -9,15 +9,7 @@ from .normalizer import stable_id
 
 DECISIONS = {"pass", "conditional", "fail", "unknown"}
 SAFETY_CRITICAL_RISKS = {"water_safety", "height_exposure", "traffic_safety"}
-SAFETY_MITIGATION_TYPES = {
-    "coach",
-    "safety_equipment",
-    "shallow_water",
-    "lifeguard",
-    "official_service",
-    "guardrail",
-    "transport_substitution",
-}
+LOW_FATIGUE_TRANSPORT_MODES = {"cable_car", "elevator", "escalator", "shuttle_bus", "tourist_train"}
 
 
 class FitEvaluator:
@@ -80,46 +72,40 @@ class FitEvaluator:
 
         seniors_max = max(profile.seniors_ages) if profile.seniors_ages else None
         child_min = min(profile.children_ages) if profile.children_ages else None
-        mitigations = _dicts(route_payload.get("mitigations"))
-        has_transport_substitution = _has_available_mitigation(mitigations, {"transport_substitution"})
+        transport_modes = _transport_modes(route_payload)
+        has_low_fatigue_transport = bool(set(transport_modes) & LOW_FATIGUE_TRANSPORT_MODES)
 
         for requirement in _dicts(route_payload.get("requirements")):
             if requirement.get("demand") == "climb_stairs":
                 steps = _as_float(requirement.get("magnitude"))
                 if steps is not None and steps >= 500 and (seniors_max is not None or profile.pace == "relaxed"):
-                    if has_transport_substitution:
+                    if has_low_fatigue_transport:
                         decision = _max_decision(decision, "conditional")
-                        required_actions.append("选择帖子中有证据的省力交通替代，不走高台阶方案。")
-                        reasons.append(f"{int(steps)}级台阶对老人或轻松游画像体力风险高，但存在交通替代证据。")
+                        required_actions.append("优先采用帖子中明确出现的索道、电梯、扶梯或景区接驳交通，不走高台阶方案。")
+                        reasons.append(f"{int(steps)}级台阶对老人或轻松游画像体力风险高，但路线本身包含低负担交通方式。")
                     else:
                         decision = "fail"
                         hard_fail = seniors_max is not None and seniors_max >= 70
-                        reasons.append(f"{int(steps)}级台阶对老人或轻松游画像体力风险高，且缺少替代方案证据。")
+                        reasons.append(f"{int(steps)}级台阶对老人或轻松游画像体力风险高，且路线中未体现低负担交通方式。")
 
         for risk in _dicts(route_payload.get("risks")):
             risk_type = risk.get("risk_type")
             severity = risk.get("severity") or "unknown"
             if risk_type == "water_safety" and child_min is not None and child_min <= 6:
-                if _has_available_mitigation(mitigations, {"coach", "safety_equipment", "shallow_water", "lifeguard"}):
-                    decision = _max_decision(decision, "conditional")
-                    required_actions.append("只选择有教练/救生装备/浅水区等证据的水上活动。")
-                    reasons.append("低龄儿童参与水上活动需要明确安全保障。")
-                else:
-                    decision = _max_decision(decision, "unknown")
-                    hard_fail = True
-                    missing_evidence.extend(["child_age_min", "coach_available", "safety_equipment", "shallow_water_area"])
-                    reasons.append("帖子缺少低龄儿童水上活动安全证据，不能判为适合。")
+                decision = _max_decision(decision, "unknown")
+                hard_fail = True
+                missing_evidence.extend(["child_age_min", "water_safety_detail"])
+                reasons.append("帖子缺少低龄儿童水上活动安全证据，不能判为适合。")
             elif risk_type in SAFETY_CRITICAL_RISKS and severity in {"high", "unknown"} and (child_min is not None or seniors_max is not None):
-                if not _has_available_mitigation(mitigations, SAFETY_MITIGATION_TYPES):
-                    decision = _max_decision(decision, "unknown")
-                    hard_fail = True
-                    missing_evidence.append(f"{risk_type}_mitigation")
-                    reasons.append(f"{risk_type} 风险缺少针对老人或儿童的缓解证据。")
+                decision = _max_decision(decision, "unknown")
+                hard_fail = True
+                missing_evidence.append(f"{risk_type}_detail")
+                reasons.append(f"{risk_type} 风险缺少针对老人或儿童的充分说明。")
             elif risk_type == "fatigue" and severity == "high" and (seniors_max is not None or child_min is not None or profile.pace == "relaxed"):
-                if has_transport_substitution:
+                if has_low_fatigue_transport:
                     decision = _max_decision(decision, "conditional")
-                    required_actions.append("避开高体力段或采用交通替代。")
-                    reasons.append("高体力玩法与老人、儿童或轻松游画像冲突，需要替代动作。")
+                    required_actions.append("优先采用路线中已有的索道、电梯、扶梯或景区接驳交通，避免高体力路段。")
+                    reasons.append("高体力玩法与老人、儿童或轻松游画像冲突，需要依赖低负担交通方式执行。")
                 else:
                     decision = _max_decision(decision, "fail")
                     reasons.append("高体力玩法与老人、儿童或轻松游画像冲突。")
@@ -156,21 +142,19 @@ class FitEvaluator:
         child_min = min(profile.children_ages) if profile.children_ages else None
         seniors_max = max(profile.seniors_ages) if profile.seniors_ages else None
         risks = _dicts(route_payload.get("risks"))
-        mitigations = _dicts(route_payload.get("mitigations"))
         for risk in risks:
             risk_type = risk.get("risk_type")
             severity = risk.get("severity") or "unknown"
             if risk_type in SAFETY_CRITICAL_RISKS and severity in {"high", "unknown"} and (child_min is not None or seniors_max is not None):
-                if not _has_available_mitigation(mitigations, SAFETY_MITIGATION_TYPES):
-                    assessment.hard_fail = True
-                    if assessment.decision == "pass":
-                        assessment.decision = "unknown"
-                    key = f"{risk_type}_mitigation"
-                    if key not in assessment.missing_evidence:
-                        assessment.missing_evidence.append(key)
-                    reason = f"{risk_type} 对老人或儿童属于安全关键风险，缺少缓解证据，不能作为主推荐。"
-                    if reason not in assessment.reasons:
-                        assessment.reasons.append(reason)
+                assessment.hard_fail = True
+                if assessment.decision == "pass":
+                    assessment.decision = "unknown"
+                key = f"{risk_type}_detail"
+                if key not in assessment.missing_evidence:
+                    assessment.missing_evidence.append(key)
+                reason = f"{risk_type} 对老人或儿童属于安全关键风险，帖子缺少足够说明，不能作为主推荐。"
+                if reason not in assessment.reasons:
+                    assessment.reasons.append(reason)
         return assessment
 
 
@@ -197,17 +181,9 @@ def _as_float(value: Any) -> Optional[float]:
         return None
 
 
-def _has_available_mitigation(mitigations: List[Dict[str, Any]], allowed_types: Iterable[str]) -> bool:
-    allowed = set(allowed_types)
-    return any(
-        item.get("mitigation_type") in allowed and item.get("status", "unknown") == "available"
-        for item in mitigations
-    )
-
-
 def _evidence_used(route_payload: Dict[str, Any]) -> List[str]:
     evidence: List[str] = []
-    for field in ("constraints", "requirements", "risks", "mitigations"):
+    for field in ("constraints", "requirements", "risks"):
         for item in _dicts(route_payload.get(field)):
             text = item.get("evidence") or item.get("evidence_span")
             if text:
@@ -231,3 +207,16 @@ def _dedupe(values: Iterable[str]) -> List[str]:
 def _max_decision(current: str, candidate: str) -> str:
     rank = {"pass": 0, "conditional": 1, "unknown": 2, "fail": 3}
     return candidate if rank[candidate] > rank[current] else current
+
+
+def _transport_modes(route_payload: Dict[str, Any]) -> List[str]:
+    modes: List[str] = []
+    for item in route_payload.get("dominant_transport_modes") or []:
+        text = str(item).strip()
+        if text:
+            modes.append(text)
+    for segment in _dicts(route_payload.get("segments")):
+        mode = str(segment.get("transport_mode") or "").strip()
+        if mode and mode != "unknown":
+            modes.append(mode)
+    return _dedupe(modes)

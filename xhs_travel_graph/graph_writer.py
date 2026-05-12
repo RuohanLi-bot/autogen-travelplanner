@@ -7,10 +7,8 @@ from .graph_repository import QueryRunner
 from .models import (
     ConstraintFact,
     FitAssessment,
-    MitigationFact,
     RequirementFact,
     RiskFact,
-    RouteAlternativeFact,
     RouteSegmentFact,
     RouteVariantFact,
     XHSPostEvidence,
@@ -18,7 +16,6 @@ from .models import (
 from .normalizer import (
     constraint_id,
     evidence_id,
-    mitigation_id,
     requirement_id,
     risk_id,
     stable_id,
@@ -137,10 +134,6 @@ class XHSTravelGraphWriter:
             self._write_requirement(post, fact, requirement)
         for risk in fact.risks:
             self._write_risk(post, fact, risk)
-        for mitigation in fact.mitigations:
-            self._write_mitigation(post, fact, mitigation)
-        for alternative in fact.alternatives:
-            self._write_alternative(post, fact, alternative)
 
     def write_fit_assessment(self, parent_label: str, parent_id: str, assessment: FitAssessment) -> None:
         if parent_label not in {"RouteVariant", "PlayMode"}:
@@ -229,53 +222,6 @@ class XHSTravelGraphWriter:
         )
         if segment.evidence_span:
             self._write_evidence(post, fact.run_id, segment.evidence_span)
-
-    def _write_alternative(self, post: XHSPostEvidence, fact: RouteVariantFact, alternative: RouteAlternativeFact) -> None:
-        alternative_id = stable_id(fact.route_variant_id, "alternative", alternative.option_name, alternative.evidence_span)
-        self.query_runner.query(
-            """
-            MERGE (alt:RouteAlternative {id: $alternative_id})
-            SET alt.run_id = $run_id,
-                alt.option_name = $option_name,
-                alt.evidence_span = $evidence_span
-            WITH alt
-            MATCH (rv:RouteVariant {id: $route_variant_id})
-            MERGE (rv)-[:HAS_ALTERNATIVE]->(alt)
-            """,
-            {
-                "alternative_id": alternative_id,
-                "run_id": fact.run_id,
-                "route_variant_id": fact.route_variant_id,
-                "option_name": alternative.option_name,
-                "evidence_span": alternative.evidence_span,
-            },
-        )
-        for constraint in alternative.constraints:
-            cid = self._write_constraint(post, fact, constraint)
-            self._link_alternative_fact(alternative_id, "HAS_CONSTRAINT", "Constraint", cid)
-        for requirement in alternative.requirements:
-            rid = self._write_requirement(post, fact, requirement)
-            self._link_alternative_fact(alternative_id, "REQUIRES", "Requirement", rid)
-        for risk in alternative.risks:
-            rid = self._write_risk(post, fact, risk)
-            self._link_alternative_fact(alternative_id, "HAS_RISK", "Risk", rid)
-        for mitigation in alternative.mitigations:
-            mid = self._write_mitigation(post, fact, mitigation)
-            self._link_alternative_fact(alternative_id, "HAS_MITIGATION", "Mitigation", mid)
-
-    def _link_alternative_fact(self, alternative_id: str, rel_type: str, label: str, node_id: str) -> None:
-        if rel_type not in {"HAS_CONSTRAINT", "REQUIRES", "HAS_RISK", "HAS_MITIGATION"}:
-            raise ValueError("Invalid alternative relationship type")
-        if label not in {"Constraint", "Requirement", "Risk", "Mitigation"}:
-            raise ValueError("Invalid alternative label")
-        self.query_runner.query(
-            f"""
-            MATCH (alt:RouteAlternative {{id: $alternative_id}})
-            MATCH (n:{label} {{id: $node_id}})
-            MERGE (alt)-[:{rel_type}]->(n)
-            """,
-            {"alternative_id": alternative_id, "node_id": node_id},
-        )
 
     def _write_constraint(self, post: XHSPostEvidence, fact: RouteVariantFact, item: ConstraintFact) -> str:
         ev_id = self._write_evidence(post, fact.run_id, item.evidence_span or fact.evidence_span)
@@ -372,37 +318,6 @@ class XHSTravelGraphWriter:
         )
         return rid
 
-    def _write_mitigation(self, post: XHSPostEvidence, fact: RouteVariantFact, item: MitigationFact) -> str:
-        ev_id = self._write_evidence(post, fact.run_id, item.evidence_span or fact.evidence_span)
-        mid = mitigation_id(fact.route_variant_id, item)
-        self.query_runner.query(
-            """
-            MERGE (mit:Mitigation {id: $mitigation_id})
-            SET mit.run_id = $run_id,
-                mit.mitigation_type = $mitigation_type,
-                mit.method = $method,
-                mit.extra_cost_cny = $extra_cost_cny,
-                mit.status = $status
-            WITH mit
-            MATCH (rv:RouteVariant {id: $route_variant_id})
-            MERGE (rv)-[:HAS_MITIGATION]->(mit)
-            WITH mit
-            MATCH (ev:Evidence {id: $evidence_id})
-            MERGE (mit)-[:SUPPORTED_BY]->(ev)
-            """,
-            {
-                "mitigation_id": mid,
-                "run_id": fact.run_id,
-                "route_variant_id": fact.route_variant_id,
-                "mitigation_type": item.mitigation_type,
-                "method": item.method,
-                "extra_cost_cny": item.extra_cost_cny,
-                "status": item.status,
-                "evidence_id": ev_id,
-            },
-        )
-        return mid
-
     def _write_evidence(self, post: XHSPostEvidence, run_id: str, text: str) -> str:
         ev_text = text or post.body[:1000]
         ev_id = evidence_id(post.post_id, ev_text)
@@ -441,12 +356,6 @@ def _route_summary(fact: RouteVariantFact) -> Dict[str, Any]:
         for c in fact.constraints
         if c.metric == "physical_load_rank" and c.value_num is not None
     )
-    for alt in fact.alternatives:
-        load_ranks.extend(
-            int(c.value_num)
-            for c in alt.constraints
-            if c.metric == "physical_load_rank" and c.value_num is not None
-        )
     return {
         "duration_min": min(durations_min) if durations_min else None,
         "duration_max_min": max(durations_max) if durations_max else None,
@@ -460,8 +369,4 @@ def _collect_costs(fact: RouteVariantFact) -> List[float]:
     costs: List[float] = []
     costs.extend(s.extra_cost_cny for s in fact.segments if s.extra_cost_cny is not None)
     costs.extend(c.value_num for c in fact.constraints if c.metric == "extra_cost_cny" and c.value_num is not None)
-    costs.extend(m.extra_cost_cny for m in fact.mitigations if m.extra_cost_cny is not None)
-    for alt in fact.alternatives:
-        costs.extend(c.value_num for c in alt.constraints if c.metric == "extra_cost_cny" and c.value_num is not None)
-        costs.extend(m.extra_cost_cny for m in alt.mitigations if m.extra_cost_cny is not None)
     return [float(cost) for cost in costs if cost is not None]

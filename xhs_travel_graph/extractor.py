@@ -6,10 +6,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from .models import (
     ConstraintFact,
-    MitigationFact,
     RequirementFact,
     RiskFact,
-    RouteAlternativeFact,
     RouteSegmentFact,
     RouteVariantFact,
     XHSPostEvidence,
@@ -19,58 +17,54 @@ from .normalizer import normalize_route_variant, stable_id, validate_route_varia
 logger = logging.getLogger(__name__)
 
 
-SYSTEM_PROMPT = """你是旅行网页信息结构化抽取器。
-只抽取原文有证据支持的旅行事实，不要补造数值，不要直接判断是否推荐。
+SYSTEM_PROMPT = """你是旅行网页信息结构化抽取器，只抽取原文有证据支持的旅行事实。
 输出必须是 JSON object，格式为：
 {
   "route_variants": [
     {
       "name": "路线或活动名称",
       "destination": "目的地，可为空",
-      "places": ["地点"],
-      "style_tags": ["relaxed", "family", "budget", "intensive"],
+      "places": ["路线中出现的地点名称，按原文抽取"],
+      "style_tags": ["从原文总结出的风格描述，使用短文本，自由生成，例如：轻松慢游、亲子友好、强体力消耗、等等"],
       "segments": [
         {
           "order": 1,
           "from_place": "",
           "to_place": "",
-          "place_names": ["地点"],
-          "transport_mode": "walking/cable_car/elevator/escalator/shuttle_bus/unknown",
+          "place_names": ["该段涉及的地点名称"],
+          "transport_mode": "标准化交通方式：walking/cycling/driving/bus/subway/taxi/boat/cable_car/escalator/stairs/mixed/unknown",
           "duration_min": null,
           "duration_max_min": null,
           "stairs": null,
           "extra_cost_cny": null,
           "physical_load_rank": null,
-          "evidence_span": "原文片段"
-        }
-      ],
-      "alternatives": [
-        {
-          "option_name": "选项名，例如 escalator 或 stairs",
-          "constraints": [],
-          "requirements": [],
-          "risks": [],
-          "mitigations": [],
-          "evidence_span": "原文片段"
+          "evidence_span": "支持该段信息的原文片段"
         }
       ],
       "constraints": [
-        {"metric": "stairs/duration_min/duration_max_min/extra_cost_cny/physical_load_rank/transport_mode/style", "value_num": null, "value_text": "", "unit": "", "bound": "exact/min/max/range/unknown", "polarity": "positive/negative/neutral", "evidence_span": "原文片段"}
+        {"metric": "约束指标名称，使用简短自然语言，常见指标仅作参考：stairs/duration_min/duration_max_min/extra_cost_cny/physical_load_rank/transport_mode/style", "value_num": null, "value_text": "", "unit": "", "bound": "exact/min/max/range/unknown", "polarity": "positive/negative/neutral", "evidence_span": "原文片段"}
       ],
       "requirements": [
-        {"requirement_type": "mobility/water_activity/time/budget/traffic", "demand": "climb_stairs/balance_and_swimming_or_supervision/etc", "magnitude": null, "unit": "", "evidence_span": "原文片段"}
+        {"requirement_type": "对参与者的要求类型，常见指标仅作参考：mobility/water_activity/time/budget/traffic", "demand": "具体要求描述，尽量贴近原文", "magnitude": null, "unit": "", "evidence_span": "原文片段"}
       ],
       "risks": [
-        {"risk_type": "fatigue/water_safety/height_exposure/traffic_safety/crowd", "severity": "low/medium/high/unknown", "reason": "", "evidence_span": "原文片段"}
-      ],
-      "mitigations": [
-        {"mitigation_type": "transport_substitution/coach/safety_equipment/shallow_water/lifeguard/official_service", "method": "", "extra_cost_cny": null, "status": "available/unavailable/unknown", "evidence_span": "原文片段"}
+        {"risk_type": "风险类型，常见类型仅作参考：fatigue/water_safety/height_exposure/traffic_safety/crowd", "severity": "low/medium/high/unknown", "reason": "风险原因，尽量贴近原文", "evidence_span": "原文片段"}
       ],
       "evidence_span": "覆盖该路线的原文片段"
     }
   ]
 }
-如果原文只有单个活动，也创建一个 route_variant；如果证据不足，对应字段留空或 unknown。"""
+抽取规则：
+1. 只抽取原文明确支持的信息，不要根据常识或经验补充缺失内容。
+2. 对于语义空间较大的描述字段，允许模型根据原文自由总结自然语言描述，不要强行映射到少量固定标签。
+3. 对于语义空间较小、便于标准化的字段，必须使用受控值或固定量表。
+4. style_tags 允许自由生成短描述，重点概括路线风格、节奏和整体体验，不要限定为少数预设词。
+5. transport_mode 必须使用列举值；无法判断时填 unknown。
+6. physical_load_rank 为整数 1-5，1 表示体力负担最轻，5 表示最重；无法判断时填 null。
+7. 如果原文没有明确证据，对应字段填空字符串、空数组或 null，不要猜测。
+8. 如果原文只有单个活动，也创建一个 route_variant。
+9. evidence_span 必须尽量截取能够直接支持该对象内容的原文片段，优先保留最关键证据。
+10. 不要重复填充语义相近字段；同一信息优先放到最贴切的字段中。"""
 
 
 class XHSTravelFactExtractor:
@@ -78,19 +72,13 @@ class XHSTravelFactExtractor:
         self.llm_client = llm_client
 
     def extract(self, post: XHSPostEvidence) -> List[RouteVariantFact]:
-        payload: Dict[str, Any] = {}
-        if self.llm_client is not None and getattr(self.llm_client, "available", lambda: False)():
-            payload = self.llm_client.generate_json(
-                system_prompt=SYSTEM_PROMPT,
-                user_prompt=self._build_user_prompt(post),
-                temperature=0.0,
-                default={},
-            )
-
-        variants = self._parse_payload(post, payload)
-        if not variants:
-            variants = self._fallback_extract(post)
-        return variants
+        payload = self.llm_client.generate_json(
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt=self._build_user_prompt(post),
+            temperature=0.0,
+            default={},
+        )
+        return self._parse_payload(post, payload)
 
     def _build_user_prompt(self, post: XHSPostEvidence) -> str:
         return (
@@ -126,11 +114,9 @@ class XHSTravelFactExtractor:
                 destination=_clean_text(raw.get("destination")),
                 places=_string_list(raw.get("places")),
                 segments=[self._segment_from_dict(i, item) for i, item in enumerate(_dicts(raw.get("segments")), 1)],
-                alternatives=[self._alternative_from_dict(item) for item in _dicts(raw.get("alternatives"))],
                 constraints=[self._constraint_from_dict(item) for item in _dicts(raw.get("constraints"))],
                 requirements=[self._requirement_from_dict(item) for item in _dicts(raw.get("requirements"))],
                 risks=[self._risk_from_dict(item) for item in _dicts(raw.get("risks"))],
-                mitigations=[self._mitigation_from_dict(item) for item in _dicts(raw.get("mitigations"))],
                 style_tags=_string_list(raw.get("style_tags")),
                 evidence_span=evidence_span,
             )
@@ -151,16 +137,6 @@ class XHSTravelFactExtractor:
             stairs=_as_int(raw.get("stairs")),
             extra_cost_cny=_as_float(raw.get("extra_cost_cny")),
             physical_load_rank=_as_int(raw.get("physical_load_rank")),
-            evidence_span=_clean_text(raw.get("evidence_span")),
-        )
-
-    def _alternative_from_dict(self, raw: Dict[str, Any]) -> RouteAlternativeFact:
-        return RouteAlternativeFact(
-            option_name=_clean_text(raw.get("option_name")) or "unknown",
-            constraints=[self._constraint_from_dict(item) for item in _dicts(raw.get("constraints"))],
-            requirements=[self._requirement_from_dict(item) for item in _dicts(raw.get("requirements"))],
-            risks=[self._risk_from_dict(item) for item in _dicts(raw.get("risks"))],
-            mitigations=[self._mitigation_from_dict(item) for item in _dicts(raw.get("mitigations"))],
             evidence_span=_clean_text(raw.get("evidence_span")),
         )
 
@@ -191,42 +167,6 @@ class XHSTravelFactExtractor:
             reason=_clean_text(raw.get("reason")),
             evidence_span=_clean_text(raw.get("evidence_span")),
         )
-
-    def _mitigation_from_dict(self, raw: Dict[str, Any]) -> MitigationFact:
-        return MitigationFact(
-            mitigation_type=_clean_text(raw.get("mitigation_type")) or "unknown",
-            method=_clean_text(raw.get("method")),
-            extra_cost_cny=_as_float(raw.get("extra_cost_cny")),
-            status=_enum(raw.get("status"), {"available", "unavailable", "unknown"}, "unknown"),
-            evidence_span=_clean_text(raw.get("evidence_span")),
-        )
-
-    def _fallback_extract(self, post: XHSPostEvidence) -> List[RouteVariantFact]:
-        places = _guess_places_from_route_text(post.body)
-        segments = []
-        if places:
-            for idx, place in enumerate(places):
-                segments.append(
-                    RouteSegmentFact(
-                        order=idx + 1,
-                        place_names=[place],
-                        transport_mode="unknown",
-                        evidence_span=post.body[:1000],
-                    )
-                )
-        variant = RouteVariantFact(
-            route_variant_id=stable_id(post.post_id, post.title or post.query, post.body[:160]),
-            post_id=post.post_id,
-            run_id=post.run_id,
-            name=post.title or post.query or "小红书路线",
-            destination=_guess_destination(post),
-            places=places,
-            segments=segments,
-            evidence_span=post.body[:1000],
-        )
-        normalized = validate_route_variant(normalize_route_variant(variant))
-        return [normalized] if normalized else []
-
 
 def _dicts(value: Any) -> List[Dict[str, Any]]:
     if not isinstance(value, list):
@@ -261,22 +201,3 @@ def _enum(value: Any, allowed: Iterable[str], default: str) -> str:
 
 def _clean_text(value: Any) -> str:
     return " ".join(str(value or "").strip().split())
-
-
-def _guess_destination(post: XHSPostEvidence) -> str:
-    text = f"{post.query} {post.title} {post.body[:200]}"
-    for token in ("张家界", "天门山", "武陵源", "长沙", "三亚", "青岛", "厦门"):
-        if token in text:
-            return token
-    return ""
-
-
-def _guess_places_from_route_text(text: str) -> List[str]:
-    for line in text.splitlines():
-        if "->" in line or "→" in line or "—" in line:
-            line = re.sub(r"^.*?(?:路线|行程安排|推荐路线)[:：]\s*", "", line)
-            line = line.lstrip("-•· 　")
-            parts = re.split(r"\s*(?:->|→|—|--|➜|到)\s*", line)
-            places = [_clean_text(part).strip("，,。；;") for part in parts]
-            return [place for place in places if 1 < len(place) <= 24][:12]
-    return []

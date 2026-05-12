@@ -34,7 +34,6 @@ class XHSPlayModeClusterer:
             OPTIONAL MATCH (rv)-[:HAS_CONSTRAINT]->(c:Constraint)
             OPTIONAL MATCH (rv)-[:REQUIRES]->(req:Requirement)
             OPTIONAL MATCH (rv)-[:HAS_RISK]->(risk:Risk)
-            OPTIONAL MATCH (rv)-[:HAS_MITIGATION]->(mit:Mitigation)
             RETURN rv.id AS id,
                    rv.name AS name,
                    rv.destination AS destination,
@@ -67,12 +66,7 @@ class XHSPlayModeClusterer:
                    collect(DISTINCT {
                        risk_type: risk.risk_type,
                        severity: risk.severity
-                   }) AS risks,
-                   collect(DISTINCT {
-                       mitigation_type: mit.mitigation_type,
-                       method: mit.method,
-                       status: mit.status
-                   }) AS mitigations
+                   }) AS risks
             """,
             {"run_id": run_id, "destination": destination},
         )
@@ -184,8 +178,6 @@ def route_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> Tuple[int, List[st
         reasons.append("same_risk_or_requirement_bucket")
     if _overlap(_requirement_types(a), _requirement_types(b)):
         reasons.append("shared_requirement_type")
-    if _overlap(_mitigation_types(a), _mitigation_types(b)):
-        reasons.append("shared_mitigation_type")
     if _overlap(_list(a.get("style_tags")), _list(b.get("style_tags"))):
         reasons.append("shared_style_tag")
     return len(reasons), reasons
@@ -211,14 +203,6 @@ def _requirement_types(row: Dict[str, Any]) -> List[str]:
         item.get("requirement_type")
         for item in _dict_list(row.get("requirements"))
         if item.get("requirement_type")
-    ]
-
-
-def _mitigation_types(row: Dict[str, Any]) -> List[str]:
-    return [
-        item.get("mitigation_type")
-        for item in _dict_list(row.get("mitigations"))
-        if item.get("mitigation_type")
     ]
 
 

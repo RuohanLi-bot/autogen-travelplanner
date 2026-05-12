@@ -4,7 +4,7 @@ from xhs_travel_graph.models import RouteVariantFact, XHSPostEvidence
 from xhs_travel_graph.normalizer import normalize_route_variant
 
 
-def test_graph_writer_uses_schema_bound_nodes_and_alternatives():
+def test_graph_writer_uses_schema_bound_nodes_and_transport_constraints():
     post = XHSPostEvidence(
         post_id="p1",
         source_file="/tmp/xhs.json",
@@ -28,5 +28,4 @@ def test_graph_writer_uses_schema_bound_nodes_and_alternatives():
     cypher = "\n".join(call["cypher"] for call in runner.calls)
     assert "MERGE (post:Post" in cypher
     assert "MERGE (rv:RouteVariant" in cypher
-    assert "MERGE (alt:RouteAlternative" in cypher
     assert "MERGE (rv)-[:HAS_CONSTRAINT]->(c)" in cypher

@@ -2,7 +2,7 @@ from xhs_travel_graph.models import RouteVariantFact
 from xhs_travel_graph.normalizer import normalize_route_variant
 
 
-def test_normalizer_extracts_stairs_cost_and_alternatives():
+def test_normalizer_extracts_stairs_and_cost_constraints():
     fact = RouteVariantFact(
         route_variant_id="rv1",
         post_id="p1",
@@ -13,5 +13,4 @@ def test_normalizer_extracts_stairs_cost_and_alternatives():
     normalized = normalize_route_variant(fact)
 
     assert any(req.demand == "climb_stairs" and req.magnitude == 999 for req in normalized.requirements)
-    assert any(mit.method == "escalator" and mit.extra_cost_cny == 32 for mit in normalized.mitigations)
-    assert {alt.option_name for alt in normalized.alternatives} == {"escalator", "stairs"}
+    assert any(constraint.metric == "extra_cost_cny" and constraint.value_num == 32 for constraint in normalized.constraints)

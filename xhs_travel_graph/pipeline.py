@@ -66,29 +66,25 @@ def ingest_autoglm_json_to_structured_xhs_graph(
     mem0_client: Any,
     run_id: str = "xhs",
     destination: str = "",
-    write_schema: bool = True,
-    cluster_play_modes: bool = True,
     llm_client: Optional[Any] = None,
 ) -> Dict[str, Any]:
     posts = load_autoglm_posts(Path(json_path), run_id=run_id)
 
-    extractor = XHSTravelFactExtractor(llm_client or OpenAILLMClient())
+    extractor = XHSTravelFactExtractor(llm_client)
     facts_by_post = {}
     for post in posts:
         facts_by_post[post.post_id] = extractor.extract(post)
 
     runner = Mem0Neo4jQueryRunner(mem0_client)
     writer = XHSTravelGraphWriter(runner)
-    if write_schema:
-        writer.ensure_schema()
+    writer.ensure_schema()
     writer.write_many(posts, facts_by_post)
 
     cluster_summary: Dict[str, Any] = {}
-    if cluster_play_modes:
-        cluster_summary = XHSPlayModeClusterer(runner).cluster_and_write(
-            run_id=run_id,
-            destination=destination,
-        )
+    cluster_summary = XHSPlayModeClusterer(runner).cluster_and_write(
+        run_id=run_id,
+        destination=destination,
+    )
 
     return {
         "posts": len(posts),
@@ -96,26 +92,3 @@ def ingest_autoglm_json_to_structured_xhs_graph(
         "play_modes": cluster_summary.get("play_modes", 0),
         "cluster_summary": cluster_summary,
     }
-
-
-def dry_run_autoglm_json(json_path: Path, limit: int = 3, use_llm: bool = False) -> Dict[str, Any]:
-    posts = load_autoglm_posts(Path(json_path), run_id="xhs")
-    extractor = XHSTravelFactExtractor(OpenAILLMClient() if use_llm else None)
-    samples: List[Dict[str, Any]] = []
-    for post in posts[:limit]:
-        facts = extractor.extract(post)
-        samples.append(
-            {
-                "post_id": post.post_id,
-                "title": post.title,
-                "parse_quality": post.parse_quality,
-                "route_variants": [_model_to_dict(fact) for fact in facts],
-            }
-        )
-    return {"posts": len(posts), "sample_facts": samples}
-
-
-def _model_to_dict(model: Any) -> Dict[str, Any]:
-    if hasattr(model, "model_dump"):
-        return model.model_dump()
-    return model.dict()
