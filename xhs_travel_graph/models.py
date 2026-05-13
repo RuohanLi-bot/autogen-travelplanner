@@ -82,7 +82,14 @@ class RouteVariantFact(BaseModel):
     style_tags: List[str] = Field(default_factory=list)
     evidence_span: str
 
-
+# TravelerProfile类中budget、strength、activity、preference属性的dict：{
+#     "metric_key": str,
+#     "dimension": "budget" | "strength" | "activity" | "preference",
+#     "op": "<=" | ">=" | "==" | "in" | "not_in",
+#     "value": int | float | str | List[str] | None,
+#     "description": str,
+#     "hard": bool,
+#     }
 class TravelerProfile(BaseModel):
     profile_id: str = ""
     destination: str = ""

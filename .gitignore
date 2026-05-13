@@ -1,44 +1,39 @@
-# ---------------------------------------------------------------------------
-# 策略：默认忽略仓库内「除下面用 ! 列出的路径」以外的所有内容。
-# 以后若有新文件/目录要纳入版本控制，在下面增加一行：!相对路径
-# 例如：!utils.py  或  !config/settings.yaml
-# ---------------------------------------------------------------------------
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
 
-# 忽略根目录下除显式放行外的所有条目（子目录会随父目录一并被忽略）
-/*
-# 忽略所有子路径（与上一行配合，避免深层文件漏网）
-**/*
+# Test / tooling cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# 本文件与当前要跟踪的文件（按需追加 ! 行）
-!/.gitignore
-!/main_mem0.py
-!/graph_builder.py
-!/itinerary_models.py
-!/preload_memories.py
-!/stdout_log.py
-!/requirements.txt
-!/pyproject.toml
-!/critic_rules.py
-!/runtime_stats.py
-!/poi_research/
-!/poi_research/serp_client.py
-!/xhs_travel_graph/
-!/xhs_travel_graph/__init__.py
-!/xhs_travel_graph/models.py
-!/xhs_travel_graph/post_parser.py
-!/xhs_travel_graph/normalizer.py
-!/xhs_travel_graph/extractor.py
-!/xhs_travel_graph/graph_repository.py
-!/xhs_travel_graph/graph_writer.py
-!/xhs_travel_graph/cluster.py
-!/xhs_travel_graph/profile_parser.py
-!/xhs_travel_graph/fit_evaluator.py
-!/xhs_travel_graph/matcher.py
-!/xhs_travel_graph/pipeline.py
-!/tests/
-!/tests/test_xhs_normalizer.py
-!/tests/test_xhs_cluster.py
-!/tests/test_xhs_graph_writer.py
-!/tests/test_xhs_matcher.py
-!/xhs_mem0_constraint_graph_plan.md
-!/xhs_mem0_code_modification_plan.md
+# Virtual env / local env
+.venv/
+venv/
+env/
+.env
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs and temporary backups
+logs/
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
+*.pid
+*.seed
+*.stackdump
+*.codex_backup_*
+
+# Local runtime / generated artifacts
+output/
+dist/
+build/

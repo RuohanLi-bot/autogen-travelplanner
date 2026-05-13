@@ -90,22 +90,14 @@ from xhs_travel_graph.normalizer import stable_id
 from xhs_travel_graph.pipeline import ingest_autoglm_json_to_structured_xhs_graph
 from xhs_travel_graph.profile_parser import (
     parse_traveler_profile,
-    profile_activity_key,
     profile_budget_level,
-    profile_has_preference,
-    profile_has_role,
-    profile_is_mobility_limited,
-    profile_max_age,
-    profile_min_age,
 )
 from xhs_constraints.capability_graph_writer import CapabilityGraphWriter
 from xhs_constraints.constraint_calibrator import (
     build_planning_budget,
-    planning_budget_to_constraints,
     summarize_planning_budget,
 )
 from xhs_constraints.final_writer import write_final_itinerary
-from xhs_constraints.models import CapabilityEstimate, MetricLimit
 from xhs_constraints.optimizer import optimize_itinerary_from_play_modes
 from xhs_constraints.playmode_fits import build_play_mode_fits, format_play_mode_fit_details, summarize_play_mode_fits
 from xhs_constraints.query_semantics import (
@@ -630,76 +622,6 @@ def find_cached_xhs_query_result_for_destination(destination: str) -> Optional[D
     }
 
 
-def _estimate_from_traveler_profile(
-    *,
-    destination: str,
-    traveler_profile_id: str,
-    traveler_profile: TravelerProfile,
-) -> CapabilityEstimate:
-    metric_limits: List[MetricLimit] = []
-    metric_map = {
-        "walk_distance_km": ("walk_distance", "km"),
-        "continuous_walk_min": ("continuous_walk_time", "min"),
-        "stairs_steps": ("stairs_steps", "steps"),
-        "active_duration_h": ("active_duration", "hours"),
-        "queue_time_min": ("queue_exposure", "min"),
-        "elevation_gain_m": ("elevation_gain_m", "m"),
-    }
-    for item in traveler_profile.strength or []:
-        if not isinstance(item, dict):
-            continue
-        metric_key = str(item.get("metric_key") or "").strip()
-        metric_info = metric_map.get(metric_key)
-        if not metric_info:
-            continue
-        value = item.get("value")
-        if not isinstance(value, (int, float)):
-            continue
-        op = str(item.get("op") or "").strip()
-        if op not in {"<=", "=="}:
-            continue
-        is_hard = bool(item.get("hard", False))
-        metric, default_unit = metric_info
-        soft_limit = None
-        hard_limit = None
-        if op == "==":
-            soft_limit = float(value)
-            hard_limit = float(value) if is_hard else None
-        else:
-            if is_hard:
-                hard_limit = float(value)
-            else:
-                soft_limit = float(value)
-        metric_limits.append(
-            MetricLimit(
-                metric=metric,
-                scenario="default",
-                soft_limit=soft_limit,
-                hard_limit=hard_limit,
-                unit=default_unit,
-                confidence=0.0,
-                evidence_count=0,
-                notes=[str(item.get("description") or "traveler_profile")],
-            )
-        )
-    preferred_tags: Dict[str, float] = {}
-    if profile_has_role(traveler_profile, "senior") or profile_is_mobility_limited(traveler_profile):
-        preferred_tags["accessibility"] = 0.75
-    if profile_has_role(traveler_profile, "child"):
-        preferred_tags["family_friendly"] = 0.55
-    return CapabilityEstimate(
-        estimate_id=stable_id("traveler_profile_estimate", traveler_profile_id, destination),
-        destination=destination,
-        traveler_profile_id=traveler_profile_id,
-        metric_limits=metric_limits,
-        forbidden_same_day_pairs=[],
-        discouraged_same_day_pairs=[],
-        preferred_tags=preferred_tags,
-        notes=[f"profile_source={traveler_profile.source}"],
-        confidence=0.0,
-    )
-
-
 def run_autoglm_cli_task(
     *,
     task_instruction: str,
@@ -1207,11 +1129,6 @@ def run_xhs_full_itinerary_flow(
             capability_writer.write_traveler_profile(user_id=USER_ID, traveler_profile=profile)
             print(f"[画像补全] TravelerProfile 已补齐：{_traveler_profile_mapping_summary(profile)}", flush=True)
             print(f"[画像写图] 已写入 TravelerProfile：{_traveler_profile_mapping_summary(profile)}", flush=True)
-        capability_estimate = _estimate_from_traveler_profile(
-            destination=destination,
-            traveler_profile_id=profile.profile_id,
-            traveler_profile=profile,
-        )
         print(f"[画像摘要] 规划前画像：{_traveler_profile_mapping_summary(profile)}", flush=True)
         print(f"[玩法簇匹配] 开始从本地图谱查询目的地「{destination}」的候选玩法簇。", flush=True)
         matches = query_matching_play_modes(
@@ -1225,20 +1142,16 @@ def run_xhs_full_itinerary_flow(
         )
         print(f"[玩法簇匹配] 匹配完成：{_match_summary_for_print(matches)}", flush=True)
         planning_budget = build_planning_budget(
-            estimate=capability_estimate,
             traveler_profile=profile,
         )
         print(f"[规划预算] {summarize_planning_budget(planning_budget)}", flush=True)
-        active_constraints = planning_budget_to_constraints(
-            planning_budget=planning_budget,
-            traveler_profile=profile,
-        )
         generation_context["traveler_profile"] = _model_to_dict(profile)
 
         play_mode_fits = build_play_mode_fits(
             query_runner=runner,
             matches=matches,
-            planning_budget=planning_budget,
+            traveler_profile=profile,
+            llm_client=OpenAILLMClient(),
         )
         print(f"[玩法拟合] {summarize_play_mode_fits(play_mode_fits)}", flush=True)
         print(format_play_mode_fit_details(play_mode_fits), flush=True)
@@ -1246,14 +1159,16 @@ def run_xhs_full_itinerary_flow(
         scored_play_modes = score_play_modes(
             play_mode_fits=play_mode_fits,
             planning_budget=planning_budget,
+            traveler_profile=profile,
         )
         print(f"[候选评分] {summarize_scored_play_modes(scored_play_modes)}", flush=True)
         print(format_scored_play_mode_details(scored_play_modes), flush=True)
 
         skeleton = optimize_itinerary_from_play_modes(
             scored_play_modes=scored_play_modes,
+            traveler_profile=profile,
             planning_budget=planning_budget,
-            constraints=active_constraints,
+            constraints=planning_budget,
             destination=destination,
             trip_days=trip_days,
         )
@@ -1263,7 +1178,8 @@ def run_xhs_full_itinerary_flow(
         validation_report = validate_final_itinerary(
             itinerary=itinerary,
             skeleton=skeleton,
-            constraints=active_constraints,
+            traveler_profile=profile,
+            planning_budget=planning_budget,
         )
         print(f"[行程校验] 发现问题数量：{len(validation_report.issues)}", flush=True)
         generation_context.update(
@@ -1271,9 +1187,7 @@ def run_xhs_full_itinerary_flow(
                 "traveler_profile": _model_to_dict(profile),
                 "constraint_specs": constraint_specs,
                 "grounded_specs": grounded_specs,
-                "capability_estimate": _model_to_dict(capability_estimate),
                 "planning_budget": _model_to_dict(planning_budget),
-                "active_constraints": _model_to_dict(active_constraints),
                 "play_mode_fits": [_model_to_dict(item) for item in play_mode_fits],
                 "scored_play_modes": [_model_to_dict(item) for item in scored_play_modes],
                 "itinerary_skeleton": _model_to_dict(skeleton),
