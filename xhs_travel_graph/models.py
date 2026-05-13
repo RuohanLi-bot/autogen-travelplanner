@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -84,15 +84,15 @@ class RouteVariantFact(BaseModel):
 
 
 class TravelerProfile(BaseModel):
-    seniors_ages: List[int] = Field(default_factory=list)
-    children_ages: List[int] = Field(default_factory=list)
-    mobility_notes: List[str] = Field(default_factory=list)
-    swimming_ability: Literal["unknown", "cannot_swim", "basic", "good"] = "unknown"
-    guardian_available: Literal["unknown", "yes", "no"] = "unknown"
-    budget_level: Literal["unknown", "low", "medium", "high"] = "unknown"
-    pace: Literal["unknown", "relaxed", "normal", "intensive"] = "unknown"
-    avoid_styles: List[str] = Field(default_factory=list)
-    raw_text: str = ""
+    profile_id: str = ""
+    destination: str = ""
+    user_query: str = ""
+    figure: List[str] = Field(default_factory=list)
+    budget: List[Dict[str, Any]] = Field(default_factory=list)
+    strength: List[Dict[str, Any]] = Field(default_factory=list)
+    activity: List[Dict[str, Any]] = Field(default_factory=list)
+    preference: List[Dict[str, Any]] = Field(default_factory=list)
+    source: Literal["query_seed", "graph_reuse", "grounded"] = "query_seed"
 
 
 class FitAssessment(BaseModel):

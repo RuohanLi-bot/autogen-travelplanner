@@ -85,30 +85,34 @@ from stdout_log import stdout_to_log_file
 from runtime_stats import runtime_stats
 from xhs_travel_graph.graph_repository import Mem0Neo4jQueryRunner
 from xhs_travel_graph.matcher import query_matching_play_modes
-from xhs_travel_graph.models import MatchResult
+from xhs_travel_graph.models import MatchResult, TravelerProfile
 from xhs_travel_graph.normalizer import stable_id
 from xhs_travel_graph.pipeline import ingest_autoglm_json_to_structured_xhs_graph
-from xhs_travel_graph.post_parser import load_autoglm_posts
-from xhs_travel_graph.profile_parser import parse_traveler_profile
-from xhs_constraints.capability_graph_writer import CapabilityGraphWriter
-from xhs_constraints.capability_grounding import (
-    load_answers_from_existing_grounding_payloads,
-    parse_capability_observations,
-    run_capability_grounding,
-    summarize_capability_grounding,
+from xhs_travel_graph.profile_parser import (
+    parse_traveler_profile,
+    profile_activity_key,
+    profile_budget_level,
+    profile_has_preference,
+    profile_has_role,
+    profile_is_mobility_limited,
+    profile_max_age,
+    profile_min_age,
 )
+from xhs_constraints.capability_graph_writer import CapabilityGraphWriter
 from xhs_constraints.constraint_calibrator import (
     build_planning_budget,
-    calibrate_capability_estimate,
     planning_budget_to_constraints,
-    summarize_capability_estimate,
     summarize_planning_budget,
 )
 from xhs_constraints.final_writer import write_final_itinerary
 from xhs_constraints.models import CapabilityEstimate, MetricLimit
 from xhs_constraints.optimizer import optimize_itinerary_from_play_modes
 from xhs_constraints.playmode_fits import build_play_mode_fits, format_play_mode_fit_details, summarize_play_mode_fits
-from xhs_constraints.query_semantics import build_profile_signature, generate_capability_questions, infer_demand_graph
+from xhs_constraints.query_semantics import (
+    apply_constraint_specs_to_profile,
+    generate_figure_mapping_questions,
+    ground_constraint_spec_from_raw_result,
+)
 from xhs_constraints.scorer import format_scored_play_mode_details, score_play_modes, summarize_scored_play_modes
 from xhs_constraints.validator import validate_final_itinerary
 
@@ -253,7 +257,7 @@ SKIP_INGEST_ON_CACHE_HIT = True
 USE_EXISTING_GROUNDING_FILES = True
 if str(AUTOGLM_ROOT) not in sys.path:
     sys.path.insert(0, str(AUTOGLM_ROOT))
-from task import GROUNDING_TASK_TEMPLATE, TASK, USER_QUERY
+from task import TASK, USER_QUERY
 
 
 AUTOGLM_BROAD_OUTPUT_SCHEMA = {
@@ -337,11 +341,6 @@ KNOWN_XHS_DESTINATIONS = (
     "广州",
     "深圳",
 )
-
-
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
-
 
 def _reset_planning_context(context_variables: ContextVariables) -> None:
     context_variables["destination_features"] = ""
@@ -631,316 +630,74 @@ def find_cached_xhs_query_result_for_destination(destination: str) -> Optional[D
     }
 
 
-class _UnavailableLLMClient:
-    def available(self) -> bool:
-        return False
-
-
-def _build_reuse_semantic_seed(
-    *,
-    user_query: str,
-    destination: str,
-    traveler_profile: Any,
-) -> tuple[Any, Any]:
-    no_llm = _UnavailableLLMClient()
-    demand_graph = infer_demand_graph(
-        user_query=user_query,
-        destination=destination,
-        traveler_profile=traveler_profile,
-        llm_client=no_llm,
-    )
-    profile_signature = build_profile_signature(
-        demand_graph=demand_graph,
-        traveler_profile=traveler_profile,
-        llm_client=no_llm,
-    )
-    return demand_graph, profile_signature
-
-
-def _build_travel_persona_descriptor(
-    *,
-    user_id: str,
-    profile_signature: Any,
-) -> Dict[str, Any]:
-    signature = profile_signature.signature if hasattr(profile_signature, "signature") else {}
-    roles = [str(item).strip() for item in signature.get("companion_roles") or ["unknown"] if str(item).strip()]
-    role_key = "_".join(sorted(set(roles))) or "unknown"
-    mobility_level = str(signature.get("mobility_level") or "unknown")
-    pace = str(signature.get("pace") or "unknown")
-    budget_sensitivity = str(signature.get("budget_sensitivity") or "unknown")
-    senior_age_band = str(signature.get("senior_age_band") or "unknown")
-    child_age_band = str(signature.get("child_age_band") or "unknown")
-    persona_key = "|".join(
-        [
-            role_key,
-            f"mobility={mobility_level}",
-            f"pace={pace}",
-            f"budget={budget_sensitivity}",
-            f"senior={senior_age_band}",
-            f"child={child_age_band}",
-        ]
-    )
-    return {
-        "id": stable_id("travel_persona", user_id, persona_key),
-        "persona_key": persona_key,
-        "role_key": role_key,
-        "mobility_level": mobility_level,
-        "pace": pace,
-        "budget_sensitivity": budget_sensitivity,
-        "senior_age_band": senior_age_band,
-        "child_age_band": child_age_band,
-        "companion_roles": roles,
-        "readable_name": getattr(profile_signature, "readable_name", "") or role_key,
-    }
-
-
-def _infer_activity_type_descriptor(
-    *,
-    persona: Optional[Dict[str, Any]] = None,
-    destination: str,
-    user_query: str,
-    demand_graph: Any,
-    profile_signature: Any,
-) -> Dict[str, Any]:
-    text = f"{destination} {user_query}".lower()
-    facets = [str(item).strip() for item in getattr(profile_signature, "signature", {}).get("query_facets") or [] if str(item).strip()]
-    if any(token in text for token in ("张家界", "黄山", "泰山", "华山", "庐山", "山", "徒步", "爬山", "爬升", "台阶", "索道")):
-        activity_key = "mountain_sightseeing"
-        label = "山地观景/轻徒步"
-    elif any(token in text for token in ("迪士尼", "环球", "乐园", "游乐场", "主题公园")):
-        activity_key = "theme_park"
-        label = "主题公园"
-    elif any(token in text for token in ("博物馆", "展馆", "美术馆", "故宫")):
-        activity_key = "museum_culture"
-        label = "博物馆/人文参观"
-    elif any(token in text for token in ("海边", "沙滩", "海岛", "三亚", "鼓浪屿")):
-        activity_key = "coastal_leisure"
-        label = "海滨休闲"
-    else:
-        activity_key = "general_sightseeing"
-        label = "综合观光"
-    persona_id = str((persona or {}).get("id") or "global")
-    return {
-        "id": stable_id("activity_type", persona_id, destination, activity_key),
-        "activity_key": activity_key,
-        "destination": destination,
-        "label": label,
-        "facets": facets,
-    }
-
-
-def _persona_activity_reuse_summary(persona: Dict[str, Any], activity: Dict[str, Any], dimensions: List[Dict[str, Any]]) -> str:
-    groups = sorted({str(item.get("group") or "") for item in dimensions if str(item.get("group") or "").strip()})
-    return (
-        f"persona={persona.get('readable_name') or persona.get('role_key')}"
-        f"；activity={activity.get('activity_key')}"
-        f"；维度数={len(dimensions)}"
-        f"；groups={','.join(groups) or '无'}"
-    )
-
-
-def _llm_extract_persona_dimensions(
-    *,
-    user_query: str,
-    destination: str,
-    profile_signature: Any,
-    capability_estimate: CapabilityEstimate,
-    planning_budget: Any,
-) -> List[Dict[str, Any]]:
-    client = OpenAILLMClient()
-    fallback = _fallback_extract_persona_dimensions(
-        profile_signature=profile_signature,
-        capability_estimate=capability_estimate,
-        planning_budget=planning_budget,
-    )
-    if not getattr(client, "available", lambda: False)():
-        return fallback
-    system_prompt = (
-        "你是旅行画像偏好维度抽取器。"
-        "请把当前画像与能力边界，压缩成少量可复用的偏好维度节点。"
-        "只允许输出 group 为 strength, budget, comfort, rhythm。"
-        "strength 用于步行距离、连续步行时长、台阶、活动时长；"
-        "budget 用于预算等级；comfort 用于排队时长等舒适度限制；rhythm 用于节奏相关离散值。"
-        "不要输出 playmode、routevariant、same_day_relation 等路线/玩法节点信息。"
-        '输出 JSON object，格式为 {"dimensions":[{"group":"","metric":"","soft_limit":null,"hard_limit":null,"unit":"","value_text":"","confidence":0.0,"source":"grounded"}]}。'
-        "如果某个维度是数值型，尽量填写 soft_limit/hard_limit；如果是离散型，填写 value_text。"
-    )
-    payload = {
-        "destination": destination,
-        "user_query": user_query,
-        "profile_signature": _model_to_dict(profile_signature),
-        "capability_estimate": _model_to_dict(capability_estimate),
-        "planning_budget": _model_to_dict(planning_budget),
-        "fallback_dimensions": fallback,
-    }
-    result = client.generate_json(
-        system_prompt=system_prompt,
-        user_prompt=str(payload),
-        temperature=0.0,
-        default={},
-    )
-    dimensions = result.get("dimensions") if isinstance(result, dict) else None
-    if not isinstance(dimensions, list):
-        return fallback
-    out: List[Dict[str, Any]] = []
-    for item in dimensions:
-        if not isinstance(item, dict):
-            continue
-        group = str(item.get("group") or "").strip().lower()
-        metric = str(item.get("metric") or "").strip()
-        if group not in {"strength", "budget", "comfort", "rhythm"} or not metric:
-            continue
-        out.append(
-            {
-                "group": group,
-                "metric": metric,
-                "soft_limit": item.get("soft_limit"),
-                "hard_limit": item.get("hard_limit"),
-                "unit": str(item.get("unit") or ""),
-                "value_text": str(item.get("value_text") or ""),
-                "confidence": float(item.get("confidence") or 0.0),
-                "source": str(item.get("source") or "grounded"),
-            }
-        )
-    return out or fallback
-
-
-def _fallback_extract_persona_dimensions(
-    *,
-    profile_signature: Any,
-    capability_estimate: CapabilityEstimate,
-    planning_budget: Any,
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    group_map = {
-        "walk_distance": "strength",
-        "continuous_walk_time": "strength",
-        "stairs_steps": "strength",
-        "active_duration": "strength",
-        "queue_exposure": "comfort",
-    }
-    for item in capability_estimate.metric_limits:
-        group = group_map.get(item.metric)
-        if not group:
-            continue
-        out.append(
-            {
-                "group": group,
-                "metric": item.metric,
-                "soft_limit": item.soft_limit,
-                "hard_limit": item.hard_limit,
-                "unit": item.unit,
-                "value_text": "",
-                "confidence": item.confidence,
-                "source": "grounded",
-            }
-        )
-    budget_level = str(getattr(planning_budget, "budget_level", "") or "")
-    if budget_level and budget_level != "unknown":
-        out.append(
-            {
-                "group": "budget",
-                "metric": "budget_level",
-                "soft_limit": None,
-                "hard_limit": None,
-                "unit": "",
-                "value_text": budget_level,
-                "confidence": 0.7,
-                "source": "query+grounded",
-            }
-        )
-    pace = str(getattr(profile_signature, "signature", {}).get("pace") or "")
-    if pace and pace != "unknown":
-        out.append(
-            {
-                "group": "rhythm",
-                "metric": "pace",
-                "soft_limit": None,
-                "hard_limit": None,
-                "unit": "",
-                "value_text": pace,
-                "confidence": 0.6,
-                "source": "query",
-            }
-        )
-    return out
-
-
-def _estimate_from_persona_dimensions(
+def _estimate_from_traveler_profile(
     *,
     destination: str,
-    profile_signature_id: str,
-    dimensions: Sequence[Dict[str, Any]],
+    traveler_profile_id: str,
+    traveler_profile: TravelerProfile,
 ) -> CapabilityEstimate:
     metric_limits: List[MetricLimit] = []
-    notes = ["loaded_from_persona_dimensions"]
-    confidence_values: List[float] = []
     metric_map = {
-        "walk_distance": "walk_distance",
-        "continuous_walk_time": "continuous_walk_time",
-        "stairs_steps": "stairs_steps",
-        "active_duration": "active_duration",
-        "queue_exposure": "queue_exposure",
+        "walk_distance_km": ("walk_distance", "km"),
+        "continuous_walk_min": ("continuous_walk_time", "min"),
+        "stairs_steps": ("stairs_steps", "steps"),
+        "active_duration_h": ("active_duration", "hours"),
+        "queue_time_min": ("queue_exposure", "min"),
+        "elevation_gain_m": ("elevation_gain_m", "m"),
     }
-    for item in dimensions:
+    for item in traveler_profile.strength or []:
         if not isinstance(item, dict):
             continue
-        metric = metric_map.get(str(item.get("metric") or "").strip())
-        if not metric:
+        metric_key = str(item.get("metric_key") or "").strip()
+        metric_info = metric_map.get(metric_key)
+        if not metric_info:
             continue
-        confidence = float(item.get("confidence") or 0.0)
-        confidence_values.append(confidence)
+        value = item.get("value")
+        if not isinstance(value, (int, float)):
+            continue
+        op = str(item.get("op") or "").strip()
+        if op not in {"<=", "=="}:
+            continue
+        is_hard = bool(item.get("hard", False))
+        metric, default_unit = metric_info
+        soft_limit = None
+        hard_limit = None
+        if op == "==":
+            soft_limit = float(value)
+            hard_limit = float(value) if is_hard else None
+        else:
+            if is_hard:
+                hard_limit = float(value)
+            else:
+                soft_limit = float(value)
         metric_limits.append(
             MetricLimit(
                 metric=metric,
                 scenario="default",
-                soft_limit=item.get("soft_limit"),
-                hard_limit=item.get("hard_limit"),
-                unit=str(item.get("unit") or ""),
-                confidence=confidence,
+                soft_limit=soft_limit,
+                hard_limit=hard_limit,
+                unit=default_unit,
+                confidence=0.0,
                 evidence_count=0,
-                notes=[f"persona_group={str(item.get('group') or '')}"],
+                notes=[str(item.get("description") or "traveler_profile")],
             )
         )
+    preferred_tags: Dict[str, float] = {}
+    if profile_has_role(traveler_profile, "senior") or profile_is_mobility_limited(traveler_profile):
+        preferred_tags["accessibility"] = 0.75
+    if profile_has_role(traveler_profile, "child"):
+        preferred_tags["family_friendly"] = 0.55
     return CapabilityEstimate(
-        estimate_id=stable_id("persona_dimension_estimate", profile_signature_id, destination),
+        estimate_id=stable_id("traveler_profile_estimate", traveler_profile_id, destination),
         destination=destination,
-        profile_signature_id=profile_signature_id,
+        traveler_profile_id=traveler_profile_id,
         metric_limits=metric_limits,
         forbidden_same_day_pairs=[],
         discouraged_same_day_pairs=[],
-        preferred_tags={},
-        notes=notes,
-        confidence=(sum(confidence_values) / len(confidence_values)) if confidence_values else 0.0,
+        preferred_tags=preferred_tags,
+        notes=[f"profile_source={traveler_profile.source}"],
+        confidence=0.0,
     )
-
-
-def _apply_persona_dimension_overrides(
-    *,
-    demand_graph: Any,
-    profile_signature: Any,
-    dimensions: Sequence[Dict[str, Any]],
-) -> None:
-    budget_value = next(
-        (
-            str(item.get("value_text") or "").strip()
-            for item in dimensions
-            if str(item.get("group") or "").strip() == "budget" and str(item.get("metric") or "").strip() == "budget_level"
-        ),
-        "",
-    )
-    if budget_value and getattr(demand_graph, "budget", "unknown") == "unknown":
-        demand_graph.budget = budget_value
-    pace_value = next(
-        (
-            str(item.get("value_text") or "").strip()
-            for item in dimensions
-            if str(item.get("group") or "").strip() == "rhythm" and str(item.get("metric") or "").strip() == "pace"
-        ),
-        "",
-    )
-    if pace_value and getattr(demand_graph, "pace", "unknown") == "unknown":
-        demand_graph.pace = pace_value
 
 
 def run_autoglm_cli_task(
@@ -985,15 +742,22 @@ def run_autoglm_cli_task(
 
 def build_grounding_task_instruction(
     *,
-    question: str,
-    destination: str,
-    profile_signature: Dict[str, Any],
+    figure: List[str],
+    description: str,
 ) -> str:
-    profile_text = json.dumps(profile_signature, ensure_ascii=False)
-    base = GROUNDING_TASK_TEMPLATE.format(
-        question=question,
-        destination=destination or "",
-        profile_signature=profile_text,
+    figure_text = "、".join(str(item).strip() for item in figure if str(item).strip()) or "当前人群"
+    base = (
+        "你需要围绕下面这条用户画像约束说明，在小红书中主动搜索关键词、查看相关图文笔记，"
+        "寻找可以量化或确认这条约束/偏好的证据。\n"
+        f"【figure】\n{figure_text}\n\n"
+        f"【待求证说明】\n{description}\n\n"
+        "执行要求：\n"
+        "1. 根据 figure 和待求证说明，自行设计若干搜索表达，不要机械重复单一关键词。\n"
+        "2. 重点寻找能够支持数值、范围、偏好集合或明确结论的帖子内容。\n"
+        "3. 如果证据不足，请保留 uncertain，不要编造。\n"
+        "4. 最终必须只输出 JSON，不要输出额外解释。\n"
+        "最终 JSON 字段要求：\n"
+        'question: 当前待求证说明；answer: supported|unsupported|mixed|uncertain；summary: 简短总结；evidence: 1-5 条关键证据。'
     )
     return (
         f"{base}\n"
@@ -1171,16 +935,14 @@ def add_autoglm_result_to_mem0(
 
 def run_autoglm_grounding_question(
     *,
-    question_text: str,
-    destination: str,
-    profile_signature: Dict[str, Any],
+    figure: List[str],
+    description: str,
 ) -> Optional[str]:
     """Run one grounding question through Open-AutoGLM without fixed search-query."""
     try:
         task_instruction = build_grounding_task_instruction(
-            question=question_text,
-            destination=destination,
-            profile_signature=profile_signature,
+            figure=figure,
+            description=description,
         )
         result = load_cached_autoglm_grounding_result(
             task_instruction=task_instruction,
@@ -1287,33 +1049,62 @@ def _structured_result_summary_for_print(result: Dict[str, Any]) -> str:
 
 def _profile_summary_for_print(profile: Any) -> str:
     parts = []
-    seniors = getattr(profile, "seniors_ages", []) or []
-    children = getattr(profile, "children_ages", []) or []
-    if seniors:
-        parts.append("老人=" + "、".join(str(age) + "岁" for age in seniors))
-    if children:
-        parts.append("儿童=" + "、".join(str(age) + "岁" for age in children))
-    mobility = getattr(profile, "mobility_notes", []) or []
-    if mobility:
-        parts.append("行动备注=" + "、".join(str(item) for item in mobility[:3]))
-    pace = getattr(profile, "pace", "unknown")
-    budget = getattr(profile, "budget_level", "unknown")
-    parts.append(f"节奏={pace}")
+    figures = getattr(profile, "figure", []) or []
+    if figures:
+        parts.append("figure=" + "、".join(str(item) for item in figures))
+    activity = _profile_spec_values(getattr(profile, "activity", []) or [])
+    if activity:
+        parts.append("活动=" + "、".join(activity[:3]))
+    preference = _profile_spec_values(getattr(profile, "preference", []) or [])
+    if preference:
+        parts.append("偏好=" + "、".join(preference[:3]))
+    strength_keys = _profile_spec_metric_keys(getattr(profile, "strength", []) or [])
+    if strength_keys:
+        parts.append("strength=" + "、".join(strength_keys[:5]))
+    budget = profile_budget_level(profile) if isinstance(profile, TravelerProfile) else "unknown"
     parts.append(f"预算={budget}")
     return "；".join(parts)
 
-
-def _demand_graph_summary_for_print(graph: Any) -> str:
-    claim_metrics = [str(getattr(item, "metric", "")) for item in getattr(graph, "claims", []) or [] if getattr(item, "metric", "")]
-    questions = getattr(graph, "retrieval_questions", []) or []
-    tradeoffs = getattr(graph, "tradeoffs", []) or []
+def _traveler_profile_mapping_summary(profile: TravelerProfile) -> str:
+    strength_keys = _profile_spec_metric_keys(profile.strength or [])
     return (
-        f"节奏={getattr(graph, 'pace', 'unknown')}；"
-        f"预算={getattr(graph, 'budget', 'unknown')}；"
-        f"claims={','.join(claim_metrics[:8]) or '无'}；"
-        f"检索问题={len(questions)}；"
-        f"取舍={','.join(str(item) for item in tradeoffs[:3]) or '无'}"
+        f"figure={','.join(profile.figure) or '无'}；"
+        f"预算={profile_budget_level(profile)}；"
+        f"活动={','.join(_profile_spec_values(profile.activity or [])) or '无'}；"
+        f"偏好={','.join(_profile_spec_values(profile.preference or [])) or '无'}；"
+        f"strength={','.join(strength_keys) or '无'}"
     )
+
+
+def _profile_spec_metric_keys(items: List[Any]) -> List[str]:
+    keys: List[str] = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("metric_key") or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return sorted(keys)
+
+
+def _profile_spec_values(items: List[Any]) -> List[str]:
+    values: List[str] = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        raw = item.get("value")
+        normalized_values = raw if isinstance(raw, list) else [raw]
+        for value in normalized_values:
+            text = str(value or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            values.append(text)
+    return values
 
 
 def _match_summary_for_print(matches: List[MatchResult]) -> str:
@@ -1343,25 +1134,6 @@ def _format_limit_for_print(label: str, limit: Any) -> str:
     return f"{label}: soft={soft}{unit}, hard={hard}{unit}{confidence_text}{evidence_text}{source_text}"
 
 
-def _active_constraints_summary_for_print(active: Any) -> str:
-    return "；".join(
-        [
-            _format_limit_for_print("每日步行", active.daily_walk_km),
-            _format_limit_for_print("连续步行", active.continuous_walk_min),
-            _format_limit_for_print("台阶", active.stairs_steps),
-            _format_limit_for_print("爬升", active.elevation_gain_m),
-            f"每天核心景点上限={active.max_core_pois_per_day}",
-            f"需要休息缓冲={active.require_rest_buffer}",
-        ]
-    )
-
-
-def _candidate_score_summary_for_print(scored_candidates: List[Any]) -> str:
-    hard_blocked = sum(1 for item in scored_candidates if item.hard_violations)
-    soft_warned = sum(1 for item in scored_candidates if item.soft_violations)
-    return f"已评分={len(scored_candidates)}，硬约束拦截={hard_blocked}，软约束提醒={soft_warned}"
-
-
 def _skeleton_summary_for_print(skeleton: Any) -> str:
     attraction_count = 0
     rest_count = 0
@@ -1380,185 +1152,94 @@ def run_xhs_full_itinerary_flow(
     destination: str,
     trip_days: int,
     autoglm_ingest_result: Optional[Dict[str, Any]] = None,
-    mem0_client_override: Optional[Memory] = None,
+    mem0_client: Optional[Memory] = None,
 ) -> Dict[str, Any]:
-    if not destination:
-        raise ValueError(f"Could not parse destination from USER_QUERY: {user_query}")
-    #固定规则解析用户画像
-    # todo：模型拆解或其他方式
-    profile = parse_traveler_profile(user_query)
+    profile = parse_traveler_profile(user_query, destination=destination)
     print(f"[行程生成] 解析用户画像：{_profile_summary_for_print(profile)}", flush=True)
-    graph_client = mem0_client_override or _get_xhs_mem0_client()
-    graph_client.enable_graph = True
-    runner = Mem0Neo4jQueryRunner(graph_client)
+    runner = Mem0Neo4jQueryRunner(mem0_client)
     capability_writer = CapabilityGraphWriter(runner)
-    print(f"[玩法簇匹配] 开始从本地图谱查询目的地「{destination}」的候选玩法簇。", flush=True)
-    #大模型比对profile和玩法簇
-    matches = query_matching_play_modes(
-        query_runner=runner,
-        run_id="xhs",
-        destination=destination,
-        profile=profile,
-        write_assessments=True,
-        include_blocked=False,
-        limit=max(10, trip_days * 3),
-    )
-    print(f"[玩法簇匹配] 匹配完成：{_match_summary_for_print(matches)}", flush=True)
     generation_context: Dict[str, Any] = {"mode": "play_mode_capability_planning"}
     try:
-        probe_demand_graph, probe_profile_signature = _build_reuse_semantic_seed(
-            user_query=user_query,
-            destination=destination,
-            traveler_profile=profile,
-        )
-        persona_descriptor = _build_travel_persona_descriptor(
+        constraint_specs: List[Dict[str, Any]] = []
+        grounded_specs: List[Dict[str, Any]] = []
+        #从图中抽出详细TravelerProfile
+        reused_profile = capability_writer.load_traveler_profile_by_figure(
             user_id=USER_ID,
-            profile_signature=probe_profile_signature,
+            figure=profile.figure,
         )
-        activity_descriptor = _infer_activity_type_descriptor(
-            persona=persona_descriptor,
-            destination=destination,
-            user_query=user_query,
-            demand_graph=probe_demand_graph,
-            profile_signature=probe_profile_signature,
-        )
-        reused_dimensions = capability_writer.load_user_persona_dimensions(
-            user_id=USER_ID,
-            persona_key=str(persona_descriptor.get("persona_key") or ""),
-            activity_key=str(activity_descriptor.get("activity_key") or ""),
-            destination=destination,
-        )
-        capability_questions: List[Any] = []
-        capability_answers: List[Any] = []
-        capability_observations: List[Any] = []
-        preference_reuse_hit = False
-        if reused_dimensions:
-            preference_reuse_hit = True
-            demand_graph = probe_demand_graph
-            profile_signature = probe_profile_signature
-            _apply_persona_dimension_overrides(
-                demand_graph=demand_graph,
-                profile_signature=profile_signature,
-                dimensions=reused_dimensions,
-            )
-            capability_estimate = _estimate_from_persona_dimensions(
-                destination=destination,
-                profile_signature_id=profile_signature.signature_id,
-                dimensions=reused_dimensions,
-            )
-            capability_writer.write_profile_signature(profile_signature)
-            capability_writer.write_estimate(profile_signature, capability_estimate, [])
-            generation_context.update(
-                {
-                    "preference_reuse_hit": True,
-                    "persona_descriptor": persona_descriptor,
-                    "activity_descriptor": activity_descriptor,
-                    "persona_dimensions": reused_dimensions,
+        if reused_profile:
+            profile = reused_profile.model_copy(
+                update={
+                    "destination": destination,
+                    "user_query": user_query,
+                    "source": "graph_reuse",
                 }
             )
+            print(f"[画像复用] 命中 figure 画像，已加载完整 TravelerProfile：{_traveler_profile_mapping_summary(profile)}", flush=True)
+        else:
+            print("[画像复用] 未命中 figure 画像，将进入 figure 细粒度偏好映射求证。", flush=True)
+            constraint_specs = generate_figure_mapping_questions(
+                traveler_profile=profile,
+            )
             print(
-                f"[画像复用] 命中图偏好：{_persona_activity_reuse_summary(persona_descriptor, activity_descriptor, reused_dimensions)}",
+                f"[约束生成] figure={','.join(profile.figure) or '无'}；spec数={len(constraint_specs)}",
                 flush=True,
             )
-            print(f"[语义解释] 复用 fallback 需求图：{_demand_graph_summary_for_print(demand_graph)}", flush=True)
-            print(f"[能力边界] {summarize_capability_estimate(capability_estimate)}", flush=True)
-        else:
-            demand_graph = infer_demand_graph(
-                user_query=user_query,
-                destination=destination,
+            llm_client = OpenAILLMClient()
+            for spec in constraint_specs:
+                raw_result = run_autoglm_grounding_question(
+                    figure=profile.figure,
+                    description=str(spec.get("description") or ""),
+                )
+                grounded_specs.append(
+                    ground_constraint_spec_from_raw_result(
+                        spec=spec,
+                        raw_result=raw_result or "",
+                        llm_client=llm_client,
+                    )
+                )
+            print(f"[约束求证] 完成 grounded specs：{len(grounded_specs)} 条。", flush=True)
+            profile = apply_constraint_specs_to_profile(
                 traveler_profile=profile,
+                specs=grounded_specs,
+                source="grounded",
             )
-            print(f"[语义解释] 需求图生成完成：{_demand_graph_summary_for_print(demand_graph)}", flush=True)
-            profile_signature = build_profile_signature(
-                demand_graph=demand_graph,
-                traveler_profile=profile,
-            )
-            if USE_EXISTING_GROUNDING_FILES:
-                grounding_payloads = load_existing_grounding_payloads()
-                capability_questions, capability_answers = load_answers_from_existing_grounding_payloads(
-                    grounding_payloads=grounding_payloads,
-                )
-                print(
-                    f"[能力问题] 画像={profile_signature.readable_name or '当前画像'}；复用已有 grounding 文件={len(capability_questions)}",
-                    flush=True,
-                )
-            else:
-                capability_questions = generate_capability_questions(
-                    demand_graph=demand_graph,
-                    profile_signature=profile_signature,
-                )
-                print(
-                    f"[能力问题] 画像={profile_signature.readable_name or '当前画像'}；问题数={len(capability_questions)}",
-                    flush=True,
-                )
-
-            evidence_json_path = (autoglm_ingest_result or {}).get("json_path")
-            posts = []
-            if evidence_json_path:
-                posts = load_autoglm_posts(Path(evidence_json_path), run_id="xhs")
-                print(f"[证据对齐] 已载入小红书帖子：{len(posts)} 条。", flush=True)
-            else:
-                print("[证据对齐] 未找到 AutoGLM JSON 路径，将仅依据 query 与图谱结果生成约束。", flush=True)
-
-            if not USE_EXISTING_GROUNDING_FILES:
-                capability_answers = run_capability_grounding(
-                    user_query=user_query,
-                    destination=destination,
-                    profile_signature=profile_signature,
-                    capability_questions=capability_questions,
-                    posts=posts,
-                    play_mode_matches=matches,
-                    autoglm_runner=lambda question: run_autoglm_grounding_question(
-                        question_text=question.question,
-                        destination=destination,
-                        profile_signature=profile_signature.model_dump(),
-                    ),
-                )
-            print(f"[能力求证] 问题回答完成：{summarize_capability_grounding(capability_answers)}", flush=True)
-            capability_observations = parse_capability_observations(answers=capability_answers)
-            print(f"[能力观测] 生成细粒度观测：{len(capability_observations)} 条。", flush=True)
-            capability_estimate = calibrate_capability_estimate(
-                observations=capability_observations,
-                profile_signature=profile_signature,
-                destination=destination,
-            )
-            print(f"[能力边界] {summarize_capability_estimate(capability_estimate)}", flush=True)
+            capability_writer.write_traveler_profile(user_id=USER_ID, traveler_profile=profile)
+            print(f"[画像补全] TravelerProfile 已补齐：{_traveler_profile_mapping_summary(profile)}", flush=True)
+            print(f"[画像写图] 已写入 TravelerProfile：{_traveler_profile_mapping_summary(profile)}", flush=True)
+        capability_estimate = _estimate_from_traveler_profile(
+            destination=destination,
+            traveler_profile_id=profile.profile_id,
+            traveler_profile=profile,
+        )
+        print(f"[画像摘要] 规划前画像：{_traveler_profile_mapping_summary(profile)}", flush=True)
+        print(f"[玩法簇匹配] 开始从本地图谱查询目的地「{destination}」的候选玩法簇。", flush=True)
+        matches = query_matching_play_modes(
+            query_runner=runner,
+            run_id="xhs",
+            destination=destination,
+            profile=profile,
+            write_assessments=True,
+            include_blocked=False,
+            limit=max(10, trip_days * 3),
+        )
+        print(f"[玩法簇匹配] 匹配完成：{_match_summary_for_print(matches)}", flush=True)
         planning_budget = build_planning_budget(
             estimate=capability_estimate,
-            demand_graph=demand_graph,
+            traveler_profile=profile,
         )
         print(f"[规划预算] {summarize_planning_budget(planning_budget)}", flush=True)
         active_constraints = planning_budget_to_constraints(
             planning_budget=planning_budget,
-            demand_graph=demand_graph,
+            traveler_profile=profile,
         )
-        if capability_questions:
-            capability_writer.write_questions(profile_signature, capability_questions)
-        if capability_observations:
-            capability_writer.write_observations(capability_questions, capability_observations)
-        if not preference_reuse_hit:
-            capability_writer.write_estimate(profile_signature, capability_estimate, capability_observations)
-            persona_dimensions = _llm_extract_persona_dimensions(
-                user_query=user_query,
-                destination=destination,
-                profile_signature=profile_signature,
-                capability_estimate=capability_estimate,
-                planning_budget=planning_budget,
-            )
-            generation_context["persona_dimensions"] = persona_dimensions
-            capability_writer.write_user_persona_dimensions(
-                user_id=USER_ID,
-                persona=persona_descriptor,
-                activity=activity_descriptor,
-                dimensions=persona_dimensions,
-            )
+        generation_context["traveler_profile"] = _model_to_dict(profile)
 
         play_mode_fits = build_play_mode_fits(
             query_runner=runner,
             matches=matches,
             planning_budget=planning_budget,
         )
-        capability_writer.write_playmode_fits(capability_estimate, play_mode_fits)
         print(f"[玩法拟合] {summarize_play_mode_fits(play_mode_fits)}", flush=True)
         print(format_play_mode_fit_details(play_mode_fits), flush=True)
 
@@ -1587,11 +1268,9 @@ def run_xhs_full_itinerary_flow(
         print(f"[行程校验] 发现问题数量：{len(validation_report.issues)}", flush=True)
         generation_context.update(
             {
-                "demand_graph": _model_to_dict(demand_graph),
-                "profile_signature": _model_to_dict(profile_signature),
-                "capability_questions": [_model_to_dict(item) for item in capability_questions],
-                "capability_grounding_answers": [_model_to_dict(item) for item in capability_answers],
-                "capability_observations": [_model_to_dict(item) for item in capability_observations],
+                "traveler_profile": _model_to_dict(profile),
+                "constraint_specs": constraint_specs,
+                "grounded_specs": grounded_specs,
                 "capability_estimate": _model_to_dict(capability_estimate),
                 "planning_budget": _model_to_dict(planning_budget),
                 "active_constraints": _model_to_dict(active_constraints),
@@ -3278,6 +2957,7 @@ if __name__ == "__main__":
         runtime_stats.reset()
         _install_openai_usage_patch()
         _quiet_third_party_loggers()
+        #todo：llm拆解
         #1. 解析任务请求
         task_request = parse_xhs_task_request(USER_QUERY)   
         print(
@@ -3334,7 +3014,7 @@ if __name__ == "__main__":
                 destination=task_request["destination"],
                 trip_days=task_request["trip_days"],
                 autoglm_ingest_result=ingest_result,
-                mem0_client_override=xhs_client,
+                mem0_client=xhs_client,
             )
         finally:
             stats = runtime_stats.snapshot()

@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from .models import FitAssessment, TravelerProfile
 from .normalizer import stable_id
+from .profile_parser import profile_has_preference, profile_max_age, profile_min_age
 
 
 DECISIONS = {"pass", "conditional", "fail", "unknown"}
@@ -70,15 +71,15 @@ class FitEvaluator:
         decision = "pass" if evidence_used else "unknown"
         hard_fail = False
 
-        seniors_max = max(profile.seniors_ages) if profile.seniors_ages else None
-        child_min = min(profile.children_ages) if profile.children_ages else None
+        seniors_max = profile_max_age(profile, "senior")
+        child_min = profile_min_age(profile, "child")
         transport_modes = _transport_modes(route_payload)
         has_low_fatigue_transport = bool(set(transport_modes) & LOW_FATIGUE_TRANSPORT_MODES)
 
         for requirement in _dicts(route_payload.get("requirements")):
             if requirement.get("demand") == "climb_stairs":
                 steps = _as_float(requirement.get("magnitude"))
-                if steps is not None and steps >= 500 and (seniors_max is not None or profile.pace == "relaxed"):
+                if steps is not None and steps >= 500 and (seniors_max is not None or profile_has_preference(profile, "relaxed")):
                     if has_low_fatigue_transport:
                         decision = _max_decision(decision, "conditional")
                         required_actions.append("优先采用帖子中明确出现的索道、电梯、扶梯或景区接驳交通，不走高台阶方案。")
@@ -101,7 +102,7 @@ class FitEvaluator:
                 hard_fail = True
                 missing_evidence.append(f"{risk_type}_detail")
                 reasons.append(f"{risk_type} 风险缺少针对老人或儿童的充分说明。")
-            elif risk_type == "fatigue" and severity == "high" and (seniors_max is not None or child_min is not None or profile.pace == "relaxed"):
+            elif risk_type == "fatigue" and severity == "high" and (seniors_max is not None or child_min is not None or profile_has_preference(profile, "relaxed")):
                 if has_low_fatigue_transport:
                     decision = _max_decision(decision, "conditional")
                     required_actions.append("优先采用路线中已有的索道、电梯、扶梯或景区接驳交通，避免高体力路段。")
@@ -110,8 +111,8 @@ class FitEvaluator:
                     decision = _max_decision(decision, "fail")
                     reasons.append("高体力玩法与老人、儿童或轻松游画像冲突。")
 
-        for style in profile.avoid_styles:
-            if style in _string_list(route_payload.get("style_tags")):
+        for style in ("intensive",):
+            if profile_has_preference(profile, f"avoid_{style}") and style in _string_list(route_payload.get("style_tags")):
                 decision = _max_decision(decision, "fail")
                 reasons.append(f"用户明确规避 {style} 风格。")
 
@@ -139,8 +140,8 @@ class FitEvaluator:
         route_payload: Dict[str, Any],
         assessment: FitAssessment,
     ) -> FitAssessment:
-        child_min = min(profile.children_ages) if profile.children_ages else None
-        seniors_max = max(profile.seniors_ages) if profile.seniors_ages else None
+        child_min = profile_min_age(profile, "child")
+        seniors_max = profile_max_age(profile, "senior")
         risks = _dicts(route_payload.get("risks"))
         for risk in risks:
             risk_type = risk.get("risk_type")

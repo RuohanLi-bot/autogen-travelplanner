@@ -80,7 +80,6 @@ def ingest_autoglm_json_to_structured_xhs_graph(
     writer.ensure_schema()
     writer.write_many(posts, facts_by_post)
 
-    cluster_summary: Dict[str, Any] = {}
     cluster_summary = XHSPlayModeClusterer(runner).cluster_and_write(
         run_id=run_id,
         destination=destination,

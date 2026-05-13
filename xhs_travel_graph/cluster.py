@@ -81,8 +81,10 @@ class XHSPlayModeClusterer:
             return [[node] for node in graph.nodes]
         try:
             communities = nx.algorithms.community.louvain_communities(graph, weight="weight", seed=42)
+            print("社区发现算法成功")
         except Exception:
             communities = nx.algorithms.community.greedy_modularity_communities(graph, weight="weight")
+            print("社区发现失败，回退到贪心模块度社区发现算法")
         return [sorted(list(community)) for community in communities if community]
 
     def _summarize_community(
@@ -227,7 +229,7 @@ def _name_play_mode(destination: str, places: List[str], transports: List[str], 
     if "intensive" in style_tags or (load_rank is not None and load_rank >= 4):
         style = "高强度打卡线"
     elif "family" in style_tags or "relaxed" in style_tags or (load_rank is not None and load_rank <= 2):
-        style = "亲子轻松线"
+        style = "轻松线"
     elif "budget" in style_tags:
         style = "省钱线"
     return f"{destination or '目的地'}-{place_part}-{transport_part}-{style}"
